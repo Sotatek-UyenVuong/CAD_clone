@@ -119,14 +119,21 @@ Flow:
 - Đã thêm giới hạn độ dài query/token để tránh query quá dài gây lỗi DB.
 - Có xử lý regex compile error để không làm vỡ pipeline.
 
-## 7) Tool behavior tóm tắt
+## 7) Layout detect model (lưu ý vận hành)
+
+- Hệ thống upload PDF chuẩn vẫn dùng `LayoutDetector` để detect block layout theo trang trước khi build `context_md`.
+- Dữ liệu/training assets cho layout detect nằm ở phần `layout_detect/` (đã dọn các artifact archive không còn dùng trong runtime chính).
+- Khi deploy model mới, cần bảo đảm output class mapping vẫn tương thích với downstream block/page processor để tránh lệch schema context.
+
+## 8) Tool behavior tóm tắt
 
 - `count_tool`: ưu tiên DXF -> image -> context.
 - `area_tool`: ưu tiên catalog/unit -> vision -> context.
 - `report_tool`: xuất PDF/DOCX/Excel từ kết quả đã có scope.
 - Q&A orchestrator có fallback cho action `count`: nếu thiếu page scope nhưng file có `dxf_path`, chạy đếm trực tiếp theo DXF file-level.
+- Quan trọng: flow DXF cho `count/area` hiện được tối ưu theo convention bản vẽ kiến trúc Nhật (Japanese CAD drawing conventions + symbol DB tiếng Nhật). Với tài liệu ngoài miền này, độ chính xác có thể giảm và nên fallback thêm vision/context.
 
-## 8) Storage + scope
+## 9) Storage + scope
 
 Collections chính:
 - `folders`, `files`, `pages`
@@ -142,7 +149,7 @@ Scope behavior:
   - image-only có thể đi search tool,
   - có query thì vào orchestrator QA.
 
-## 9) Endpoint thường dùng
+## 10) Endpoint thường dùng
 
 - Upload: `/upload`, `/upload/{job_id}/status`
 - QA: `/qa`, `/qa/stream`, `/qa/jobs`, `/qa/jobs/{job_id}`, `/qa/image`, `/qa/image/stream`
@@ -156,7 +163,7 @@ Lưu ý endpoint `GET /files/{file_id}/original`:
 - Với file CAD (`.dwg`/`.dxf`), endpoint ưu tiên trả file từ `dxf_path` (tức bản DXF).
 - Nếu không phải CAD hoặc không có `dxf_path`, endpoint trả `file_url` như thông thường.
 
-## 10) Đã loại bỏ
+## 11) Đã loại bỏ
 
 - Cohere embedding logic.
 - Qdrant storage/search/delete logic.

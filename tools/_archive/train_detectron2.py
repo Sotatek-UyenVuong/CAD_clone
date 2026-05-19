@@ -1,1 +1,0 @@
-../layout_detect/scripts/train_detectron2.py

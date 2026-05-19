@@ -1,1 +1,0 @@
-../layout_detect/scripts/prepare_dataset.py

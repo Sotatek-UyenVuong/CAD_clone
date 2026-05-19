@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections import Counter
 import cv2
 import numpy as np
 from pathlib import Path
@@ -516,6 +517,204 @@ def _persist_dxf_file(dxf_src: Path, *, file_id: str, file_name: str) -> Path:
     return target_path
 
 
+def _clean_dxf_text(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\\[A-Za-z0-9;]+", "", text).replace("\\P", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _looks_like_unit_label(text: str) -> bool:
+    t = _clean_dxf_text(text)
+    if not t:
+        return False
+    if len(t) > 40:
+        return False
+    # Keep labels that usually represent countable units.
+    return bool(
+        re.search(r"\d", t)
+        or re.search(r"[A-Za-z]{1,6}\d{1,4}$", t)
+        or re.search(r"[（(]\d{1,3}[)）]", t)
+    )
+
+
+def _extract_dxf_catalog(dxf_path: Path) -> dict:
+    """Extract deterministic symbol/unit catalog from DXF for Q&A grounding."""
+    try:
+        import ezdxf  # type: ignore
+    except Exception:
+        return {"available": False, "reason": "ezdxf_unavailable", "top_symbols": [], "unit_labels": []}
+
+    try:
+        doc = ezdxf.readfile(str(dxf_path))
+        msp = doc.modelspace()
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": f"dxf_parse_error:{type(exc).__name__}",
+            "top_symbols": [],
+            "unit_labels": [],
+        }
+
+    insert_counts: Counter[str] = Counter()
+    for entity in msp.query("INSERT"):
+        try:
+            name = str(entity.dxf.name or "").strip()
+        except Exception:
+            continue
+        if not name or name.startswith("*"):
+            continue
+        insert_counts[name] += 1
+
+    unit_label_counts: Counter[str] = Counter()
+    for entity in msp:
+        if entity.dxftype() not in ("TEXT", "MTEXT"):
+            continue
+        try:
+            raw = entity.dxf.text if entity.dxftype() == "TEXT" else entity.text
+        except Exception:
+            continue
+        text = _clean_dxf_text(str(raw or ""))
+        if not _looks_like_unit_label(text):
+            continue
+        unit_label_counts[text] += 1
+
+    def _collect_block_texts(block_name: str, depth: int = 0, seen: set[str] | None = None) -> list[str]:
+        if depth > 2:
+            return []
+        if seen is None:
+            seen = set()
+        key = f"{block_name}@{depth}"
+        if key in seen:
+            return []
+        seen.add(key)
+
+        block = doc.blocks.get(block_name)
+        if block is None:
+            return []
+
+        texts: list[str] = []
+        for e in block:
+            if e.dxftype() in ("TEXT", "MTEXT"):
+                try:
+                    raw = e.dxf.text if e.dxftype() == "TEXT" else e.text
+                except Exception:
+                    continue
+                cleaned = _clean_dxf_text(str(raw or ""))
+                if cleaned:
+                    texts.append(cleaned)
+            elif e.dxftype() == "INSERT":
+                try:
+                    nested_name = str(e.dxf.name or "").strip()
+                except Exception:
+                    nested_name = ""
+                if nested_name and not nested_name.startswith("*"):
+                    texts.extend(_collect_block_texts(nested_name, depth + 1, seen))
+        # Keep order, unique.
+        deduped: list[str] = []
+        seen_text: set[str] = set()
+        for t in texts:
+            if t in seen_text:
+                continue
+            seen_text.add(t)
+            deduped.append(t)
+        return deduped
+
+    def _pick_block_alias(texts: list[str]) -> str:
+        if not texts:
+            return ""
+        priority_patterns = [
+            r"[A-Za-z]{1,8}\d{1,4}",     # EV1, M2, etc.
+            r"[（(]\d{1,3}[)）]",         # (1), （2）
+            r"[一-龯ぁ-ゔァ-ヴー]{1,20}",  # Japanese words
+        ]
+        for pat in priority_patterns:
+            for t in texts:
+                if len(t) > 40:
+                    continue
+                if re.search(pat, t):
+                    return t
+        for t in texts:
+            if 1 <= len(t) <= 24:
+                return t
+        return ""
+
+    block_meta: dict[str, dict] = {}
+    for name in insert_counts:
+        texts = _collect_block_texts(name)
+        block_meta[name] = {
+            "alias": _pick_block_alias(texts),
+            "samples": texts[:3],
+        }
+
+    top_symbols = [
+        {
+            "name": name,
+            "count": int(cnt),
+            "alias": str((block_meta.get(name) or {}).get("alias", "") or ""),
+            "samples": (block_meta.get(name) or {}).get("samples", []),
+        }
+        for name, cnt in insert_counts.most_common(120)
+    ]
+    top_units = [{"label": label, "count": int(cnt)} for label, cnt in unit_label_counts.most_common(120)]
+    return {
+        "available": True,
+        "insert_total": int(sum(insert_counts.values())),
+        "distinct_symbol_count": int(len(insert_counts)),
+        "distinct_unit_label_count": int(len(unit_label_counts)),
+        "top_symbols": top_symbols,
+        "unit_labels": top_units,
+    }
+
+
+def _build_dxf_catalog_markdown(catalog: dict) -> str:
+    if not bool(catalog.get("available")):
+        reason = str(catalog.get("reason", "unknown"))
+        return f"## DXF symbol catalog\n- Catalog unavailable ({reason})."
+
+    symbols = catalog.get("top_symbols", []) if isinstance(catalog.get("top_symbols", []), list) else []
+    units = catalog.get("unit_labels", []) if isinstance(catalog.get("unit_labels", []), list) else []
+    lines = [
+        "## DXF symbol catalog",
+        f"- INSERT total: {int(catalog.get('insert_total', 0) or 0)}",
+        f"- Distinct symbol blocks: {int(catalog.get('distinct_symbol_count', 0) or 0)}",
+        f"- Distinct unit/text labels: {int(catalog.get('distinct_unit_label_count', 0) or 0)}",
+    ]
+
+    if symbols:
+        lines.append("- Top symbol blocks:")
+        for item in symbols[:30]:
+            name = str(item.get("name", "")).strip()
+            cnt = int(item.get("count", 0) or 0)
+            alias = str(item.get("alias", "")).strip()
+            samples = item.get("samples", []) if isinstance(item.get("samples", []), list) else []
+            if name:
+                if alias:
+                    lines.append(f"  - {name} ({alias}): {cnt}")
+                else:
+                    lines.append(f"  - {name}: {cnt}")
+                if samples:
+                    sample_text = "; ".join(str(v).strip() for v in samples[:2] if str(v).strip())
+                    if sample_text:
+                        lines.append(f"    - sample: {sample_text}")
+    else:
+        lines.append("- Top symbol blocks: (none detected)")
+
+    if units:
+        lines.append("- Unit/text labels:")
+        for item in units[:30]:
+            label = str(item.get("label", "")).strip()
+            cnt = int(item.get("count", 0) or 0)
+            if label:
+                lines.append(f"  - {label}: {cnt}")
+    else:
+        lines.append("- Unit/text labels: (none detected)")
+
+    return "\n".join(lines)
+
+
 def _run_dxf_single_page_pipeline(
     *,
     source_file: Path,
@@ -529,6 +728,13 @@ def _run_dxf_single_page_pipeline(
 ) -> dict:
     """Index a DXF drawing as a single-page CAD file for count tool support."""
     dxf_path_abs = str(dxf_path.resolve())
+    catalog = _extract_dxf_catalog(dxf_path)
+    catalog_md = _build_dxf_catalog_markdown(catalog)
+    distinct_symbols = int(catalog.get("distinct_symbol_count", 0) or 0)
+    distinct_units = int(catalog.get("distinct_unit_label_count", 0) or 0)
+    top_unit_names = [str(v.get("label", "")).strip() for v in (catalog.get("unit_labels", []) or []) if str(v.get("label", "")).strip()]
+    top_unit_preview = ", ".join(top_unit_names[:8]) if top_unit_names else "none"
+
     log("[3/6] Creating folder + file records in MongoDB...")
     mongo.upsert_folder(folder_id, folder_name)
     mongo.upsert_file(
@@ -542,13 +748,15 @@ def _run_dxf_single_page_pipeline(
 
     page_id = f"{file_id}_p1"
     page_short_summary = (
-        f"CAD drawing indexed for counting from DXF source: {Path(dxf_path_abs).name}."
+        f"DXF catalog ready ({distinct_symbols} symbol blocks, {distinct_units} unit/text labels). "
+        f"Top unit labels: {top_unit_preview}. Source: {Path(dxf_path_abs).name}."
     )
     context_md = (
         "# Page 1\n\n"
         f"- Source file: {source_file.name}\n"
         f"- DXF path: {dxf_path_abs}\n"
-        "- This file is indexed as CAD geometry for count workflows."
+        "- This file is indexed as CAD geometry for count workflows.\n\n"
+        f"{catalog_md}"
     )
     log("[4/6] Creating DXF-backed page context...")
     mongo.upsert_page(
@@ -568,7 +776,8 @@ def _run_dxf_single_page_pipeline(
         f"File: {file_name}\n"
         "Type: CAD drawing (DWG/DXF)\n"
         f"DXF source: {Path(dxf_path_abs).name}\n"
-        "This file is prepared for geometry-based counting."
+        "This file is prepared for geometry-based counting.\n\n"
+        f"{catalog_md}"
     )
     mongo.update_file_summary(file_id, file_summary)
     mongo.update_file_short_summary(file_id, page_short_summary)

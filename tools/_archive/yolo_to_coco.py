@@ -1,1 +1,0 @@
-../layout_detect/scripts/yolo_to_coco.py

@@ -1,1 +1,0 @@
-../layout_detect/scripts/predict_layout.py

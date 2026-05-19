@@ -105,6 +105,10 @@ Lệnh hữu ích:
   - build `files.title_block_index`,
   - rebuild `folders.summary`.
 
+### Layout detect model
+- Runtime upload flow dùng `LayoutDetector` để detect block layout theo trang trước khi page reasoning.
+- Khi retrain/thay model trong `layout_detect/`, cần giữ ổn định class mapping vì downstream parser/context builder phụ thuộc trực tiếp vào nhãn block.
+
 ### Q&A flow (`POST /qa`)
 - Load history + recent citations + file scope + explicit pages + context summary.
 - Orchestrator chọn một action trong:
@@ -119,6 +123,10 @@ Lệnh hữu ích:
 - `run_search`: lexical retrieval trên `short_summary` + `context_md`, optional scope `folder_id`/`file_id`.
 - `run_search_tool`: nếu có ảnh thì ưu tiên title-block lookup; không match mới fallback lexical.
 - Đã thêm guard query/token trong Mongo lexical để tránh lỗi query dài.
+
+### Miền áp dụng DXF (quan trọng)
+- Tool `count` và nhánh `area` dùng DXF hiện tối ưu cho tài liệu kiến trúc Nhật (naming, symbol groups, text conventions tiếng Nhật).
+- Với bản vẽ ngoài miền Nhật, nên kỳ vọng fallback nhiều hơn qua vision/context và kiểm chứng kết quả thủ công khi cần độ chính xác cao.
 
 ## 6) Scope behavior (quan trọng)
 
