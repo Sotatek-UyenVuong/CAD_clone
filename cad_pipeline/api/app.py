@@ -42,7 +42,7 @@ from cad_pipeline.api.auth import get_current_user, require_role, router as auth
 from cad_pipeline.agents.router import classify_query
 from cad_pipeline.config import API_BASE_URL, LOCAL_CHAT_UPLOADS_DIR, LOCAL_IMAGES_DIR, USE_S3, REPORTS_DIR
 from cad_pipeline.pipeline.upload_pipeline import run_upload_pipeline
-from cad_pipeline.pipeline.qa_pipeline import run_qa
+from cad_pipeline.pipeline.qa_orchestrator_pipeline import run_qa
 from cad_pipeline.pipeline.search_pipeline import run_search
 from cad_pipeline.pipeline.delete_pipeline import delete_file as _delete_file, delete_folder as _delete_folder
 from cad_pipeline.storage import mongo
@@ -132,6 +132,8 @@ _upload_status: dict[str, dict] = {}
 _qa_jobs: dict[str, dict] = {}
 _ALLOWED_UPLOAD_EXTS = {
     ".pdf",
+    ".dwg",
+    ".dxf",
     ".doc",
     ".docx",
     ".xls",
@@ -295,8 +297,8 @@ def mark_all_notifications_read(_user: dict = Depends(get_current_user)):
 
 class QARequest(BaseModel):
     query: str
-    folder_id: str
-    session_id: str | None = None
+    folder_id: str | None = None
+    session_id: str
     file_id: str | None = None
 
 
@@ -310,23 +312,30 @@ def qa_endpoint(req: QARequest, _user: dict = Depends(get_current_user)):
     """Ask a text question about documents in a folder.
     For image-based queries use POST /qa/image (multipart).
     """
+    scope_id = (req.session_id or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=422, detail="session_id is required")
+    session_doc = mongo.get_chat_session(scope_id, user_email=_user["email"])
+    if not session_doc:
+        raise HTTPException(status_code=404, detail=f"Chat session '{scope_id}' not found")
+    session_file_ids = session_doc.get("file_ids") or []
+    session_folder_id = str(session_doc.get("folder_id") or "")
+    allowed_set = {str(fid) for fid in session_file_ids}
+
     query_type = classify_query(req.query)
 
     if query_type == "search":
         results = run_search(
             query=req.query,
-            folder_id=req.folder_id,
+            folder_id=session_folder_id or None,
             file_id=req.file_id,
         )
+        results = [r for r in results if str(r.get("file_id", "")) in allowed_set]
         return {"query_type": "search", "results": results}
-
-    scope_id = req.session_id or req.folder_id
-    session_doc = mongo.get_chat_session(scope_id, user_email=_user["email"])
-    session_file_ids = session_doc.get("file_ids") if session_doc else None
 
     result = run_qa(
         query=req.query,
-        folder_id=scope_id,
+        session_id=scope_id,
         file_id=req.file_id,
         session_file_ids=session_file_ids,
         user_email=_user["email"],
@@ -337,6 +346,14 @@ def qa_endpoint(req: QARequest, _user: dict = Depends(get_current_user)):
 @app.post("/qa/stream")
 def qa_stream_endpoint(req: QARequest, _user: dict = Depends(get_current_user)):
     """Stream Q&A progress + answer chunks (SSE)."""
+    scope_id = (req.session_id or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=422, detail="session_id is required")
+    session_doc = mongo.get_chat_session(scope_id, user_email=_user["email"])
+    if not session_doc:
+        raise HTTPException(status_code=404, detail=f"Chat session '{scope_id}' not found")
+    session_file_ids = session_doc.get("file_ids") or []
+
     events: queue.Queue[tuple[str, dict]] = queue.Queue()
     streamed_any_delta = False
 
@@ -362,12 +379,9 @@ def qa_stream_endpoint(req: QARequest, _user: dict = Depends(get_current_user)):
 
     def _run() -> None:
         try:
-            scope_id = req.session_id or req.folder_id
-            session_doc = mongo.get_chat_session(scope_id, user_email=_user["email"])
-            session_file_ids = session_doc.get("file_ids") if session_doc else None
             result = run_qa(
                 query=req.query,
-                folder_id=scope_id,
+                session_id=scope_id,
                 file_id=req.file_id,
                 session_file_ids=session_file_ids,
                 user_email=_user["email"],
@@ -409,12 +423,21 @@ def start_qa_job(
     _user: dict = Depends(get_current_user),
 ):
     """Start an async Q&A job and report pipeline progress by polling."""
+    scope_id = (req.session_id or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=422, detail="session_id is required")
+    session_doc = mongo.get_chat_session(scope_id, user_email=_user["email"])
+    if not session_doc:
+        raise HTTPException(status_code=404, detail=f"Chat session '{scope_id}' not found")
+    session_file_ids = session_doc.get("file_ids") or []
+
     job_id = str(uuid.uuid4())
     _qa_jobs[job_id] = {
         "status": "processing",
         "user_email": _user["email"],
         "query": req.query,
-        "folder_id": req.session_id or req.folder_id,
+        "session_id": scope_id,
+        "folder_id": session_folder_id or scope_id,
         "file_id": req.file_id,
         "steps": [],
         "current_step": "",
@@ -437,12 +460,9 @@ def start_qa_job(
 
     def _run() -> None:
         try:
-            scope_id = req.session_id or req.folder_id
-            session_doc = mongo.get_chat_session(scope_id, user_email=_user["email"])
-            session_file_ids = session_doc.get("file_ids") if session_doc else None
             result = run_qa(
                 query=req.query,
-                folder_id=scope_id,
+                session_id=scope_id,
                 file_id=req.file_id,
                 session_file_ids=session_file_ids,
                 user_email=_user["email"],
@@ -478,7 +498,7 @@ def get_qa_job_status(job_id: str, _user: dict = Depends(get_current_user)):
 async def qa_image_endpoint(
     query: Annotated[str, Form()] = "",
     folder_id: Annotated[str, Form()] = "",
-    session_id: Annotated[str | None, Form()] = None,
+    session_id: Annotated[str, Form()] = "",
     file_id: Annotated[str | None, Form()] = None,
     image: Annotated[UploadFile | None, File()] = None,
     _user: dict = Depends(get_current_user),
@@ -492,13 +512,19 @@ async def qa_image_endpoint(
       - image     : image file (PNG/JPG/WebP, optional)
 
     When an image is provided and the intent is "search", runs image-based
-    semantic search (Gemini describes the image → embed → Qdrant top-10).
+    search (title-block lookup first, then lexical fallback).
     Otherwise runs the standard Q&A pipeline with the image for additional
     context.
     """
-    scope_id = session_id or folder_id
+    scope_id = (session_id or "").strip()
     if not scope_id:
-        raise HTTPException(status_code=422, detail="folder_id or session_id is required")
+        raise HTTPException(status_code=422, detail="session_id is required")
+    session_doc = mongo.get_chat_session(scope_id, user_email=_user["email"])
+    if not session_doc:
+        raise HTTPException(status_code=404, detail=f"Chat session '{scope_id}' not found")
+    session_file_ids = session_doc.get("file_ids") or []
+    allowed_set = {str(fid) for fid in session_file_ids}
+    session_folder_id = str(session_doc.get("folder_id") or "")
 
     img_bytes: bytes | None = None
     user_image_url: str | None = None
@@ -512,17 +538,20 @@ async def qa_image_endpoint(
         result = run_search_tool(
             query=None,
             image_bytes=img_bytes,
-            folder_id=folder_id or None,
+            folder_id=session_folder_id or None,
             file_id=file_id,
             top_n=10,
         )
+        hits = result.get("results", []) or []
+        result["results"] = [h for h in hits if str(h.get("file_id", "")) in allowed_set]
+        result["total"] = len(result["results"])
         return {"query_type": "search", "tool_result": result, **result}
 
     result = run_qa(
         query=query,
-        folder_id=scope_id,
+        session_id=scope_id,
         file_id=file_id,
-        session_file_ids=(mongo.get_chat_session(scope_id, user_email=_user["email"]) or {}).get("file_ids"),
+        session_file_ids=session_file_ids,
         user_email=_user["email"],
         image_bytes=img_bytes,
         user_image_url=user_image_url,
@@ -535,15 +564,20 @@ async def qa_image_endpoint(
 async def qa_image_stream_endpoint(
     query: Annotated[str, Form()] = "",
     folder_id: Annotated[str, Form()] = "",
-    session_id: Annotated[str | None, Form()] = None,
+    session_id: Annotated[str, Form()] = "",
     file_id: Annotated[str | None, Form()] = None,
     image: Annotated[UploadFile | None, File()] = None,
     _user: dict = Depends(get_current_user),
 ):
     """Stream Q&A progress + answer chunks (SSE) with optional uploaded image."""
-    scope_id = session_id or folder_id
+    scope_id = (session_id or "").strip()
     if not scope_id:
-        raise HTTPException(status_code=422, detail="folder_id or session_id is required")
+        raise HTTPException(status_code=422, detail="session_id is required")
+    session_doc = mongo.get_chat_session(scope_id, user_email=_user["email"])
+    if not session_doc:
+        raise HTTPException(status_code=404, detail=f"Chat session '{scope_id}' not found")
+    session_file_ids = session_doc.get("file_ids") or []
+    session_folder_id = str(session_doc.get("folder_id") or "")
 
     img_bytes: bytes | None = None
     user_image_url: str | None = None
@@ -579,9 +613,9 @@ async def qa_image_stream_endpoint(
         try:
             result = run_qa(
                 query=query,
-                folder_id=scope_id,
+                session_id=scope_id,
                 file_id=file_id,
-                session_file_ids=(mongo.get_chat_session(scope_id, user_email=_user["email"]) or {}).get("file_ids"),
+                session_file_ids=session_file_ids,
                 user_email=_user["email"],
                 image_bytes=img_bytes,
                 user_image_url=user_image_url,
@@ -679,7 +713,7 @@ async def tools_search_endpoint(
                     → Gemini Flash describes the image
                     → description is appended to query before embedding
 
-    Returns top-N pages sorted by vector similarity with:
+    Returns top-N pages ranked by retrieval score with:
       rank, file_name, page_number, image_url, short_summary, vector_score,
       plus query_used and image_description.
     """
@@ -879,17 +913,28 @@ def get_original_file(
         raise HTTPException(status_code=404, detail="File not found")
 
     file_url = file_doc.get("file_url")
-    if not file_url:
+    dxf_path = str(file_doc.get("dxf_path") or "").strip()
+    if not file_url and not dxf_path:
         raise HTTPException(status_code=404, detail="Original file URL not found")
 
-    parsed = urlparse(str(file_url))
+    file_name = str(file_doc.get("file_name") or file_id)
+    file_ext = Path(file_name).suffix.lower()
+    prefer_dxf = file_ext in {".dwg", ".dxf"} and bool(dxf_path)
+    original_ref = dxf_path if prefer_dxf else str(file_url or "")
+    if not original_ref and dxf_path:
+        original_ref = dxf_path
+
+    parsed = urlparse(str(original_ref))
     is_remote_url = parsed.scheme in {"http", "https"} and bool(parsed.netloc)
     filename = str(file_doc.get("file_name") or Path(parsed.path).name or file_id)
+    if prefer_dxf:
+        base = Path(file_name).stem or Path(parsed.path).stem or file_id
+        filename = f"{base}.dxf"
 
     if is_remote_url:
         try:
             method = "HEAD" if request.method.upper() == "HEAD" else "GET"
-            req = UrlRequest(str(file_url), method=method)
+            req = UrlRequest(str(original_ref), method=method)
             with urlopen(req, timeout=20) as upstream:
                 content_type = upstream.headers.get("Content-Type", "") or "application/octet-stream"
                 headers = {"Content-Disposition": f'inline; filename="{filename}"'}
@@ -901,7 +946,7 @@ def get_original_file(
         except URLError as exc:
             raise HTTPException(status_code=502, detail="Cannot fetch original file URL") from exc
 
-    path = Path(str(file_url))
+    path = Path(str(original_ref))
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Original file not found on disk")
 
@@ -935,7 +980,7 @@ def delete_folder_endpoint(
     folder_id: str,
     _user: dict = Depends(require_role("admin")),
 ):
-    """Delete a folder and all its files, pages, vectors, and chat history. Admin only."""
+    """Delete a folder and all its files, pages, and chat history. Admin only."""
     folder = mongo.get_folder(folder_id)
     if not folder:
         raise HTTPException(status_code=404, detail="Folder not found")

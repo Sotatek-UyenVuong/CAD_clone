@@ -6,9 +6,8 @@ Flow:
        → Layout Detection
        → Per-block processing → S3 (block crops, optional)
        → Build Context (with S3 URLs)
-       → Save MongoDB
-       → Embedding → Save Qdrant
-       → Build file/folder summaries
+      → Save MongoDB
+      → Build file/folder summaries
 
 USE_S3=true  → upload original + pages + blocks to S3, store S3 URLs in Mongo
 USE_S3=false → keep images local, store local paths in Mongo
@@ -18,6 +17,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import importlib.util
 import re
 import shutil
 import subprocess
@@ -31,7 +31,7 @@ from PIL import Image
 from cad_pipeline.config import API_BASE_URL, LOCAL_IMAGES_DIR, LOCAL_ORIGINALS_DIR, PDF_DPI, USE_S3
 from cad_pipeline.core.pdf_to_images import pdf_to_page_images
 from cad_pipeline.core.layout_detect import LayoutDetector
-from cad_pipeline.core.marker_pdf import marker_ocr_document, marker_ocr_pdf, CHUNK_THRESHOLD
+from cad_pipeline.core.marker_pdf import marker_ocr_document
 from cad_pipeline.core.page_processor import process_page_blocks, generate_page_summary
 from cad_pipeline.core.context_builder import (
     build_page_context,
@@ -39,11 +39,11 @@ from cad_pipeline.core.context_builder import (
     build_folder_summary,
     generate_file_short_summary,
 )
-from cad_pipeline.core.embeddings import embed_text
-from cad_pipeline.storage import mongo, qdrant_store
+from cad_pipeline.storage import mongo
 
 _MARKER_EXCEL_EXTS = {".xls", ".xlsx"}
 _DOC_TO_PDF_EXTS = {".doc", ".docx"}
+_CAD_DWG_DXF_EXTS = {".dwg", ".dxf"}
 _FATAL_LLM_ERROR_TOKENS = (
     "resource_exhausted",
     "monthly spending cap",
@@ -197,24 +197,35 @@ def run_upload_pipeline(
             log=log,
         )
 
+    if suffix in _CAD_DWG_DXF_EXTS:
+        cad_tmp_dir: Path | None = None
+        try:
+            dxf_path = file_path
+            if suffix == ".dwg":
+                log("[2/6] Converting DWG to DXF...")
+                cad_tmp_dir = Path(tempfile.mkdtemp(prefix="cad_dwg2dxf_"))
+                dxf_path = _convert_dwg_to_dxf(file_path, cad_tmp_dir)
+                log(f"[2/6] Converted DWG -> DXF: {dxf_path.name}")
+            dxf_path = _persist_dxf_file(dxf_path, file_id=file_id, file_name=file_name)
+            log(f"[3/6] Persisted DXF: {dxf_path}")
+            return _run_dxf_single_page_pipeline(
+                source_file=file_path,
+                dxf_path=dxf_path,
+                file_id=file_id,
+                file_name=file_name,
+                folder_id=folder_id,
+                folder_name=folder_name,
+                original_url=original_url,
+                log=log,
+            )
+        finally:
+            if cad_tmp_dir is not None:
+                shutil.rmtree(cad_tmp_dir, ignore_errors=True)
+
     # ── Step 2: Render PDF → page images ────────────────────────────────────
     log(f"[2/8] Rendering {file_name} → page images (dpi={dpi})...")
     pages_info = pdf_to_page_images(processing_path, file_id, LOCAL_IMAGES_DIR, dpi=dpi)
     total_pages = len(pages_info)
-
-    # ── Step 2b: Marker whole-PDF OCR for large documents ───────────────────
-    # For PDFs > CHUNK_THRESHOLD pages, submit the full PDF to Marker in
-    # 10-page chunks (all concurrent). Results cached keyed by 1-based page
-    # number. Table blocks later use this to skip per-crop Marker calls.
-    marker_page_cache: dict[int, str] = {}
-    if processing_path.suffix.lower() == ".pdf" and total_pages > CHUNK_THRESHOLD:
-        log(f"[2b/8] Large PDF ({total_pages} pages) — running Marker chunked OCR "
-            f"({CHUNK_THRESHOLD}+ pages → chunks of 10)...")
-        try:
-            marker_page_cache = marker_ocr_pdf(processing_path)
-            log(f"[2b/8] Marker OCR complete — {len(marker_page_cache)} pages cached")
-        except Exception as exc:
-            log(f"[2b/8] Marker PDF OCR failed ({exc}) — falling back to per-crop mode")
 
     # ── Step 3: Ensure folder + file records in MongoDB ─────────────────────
     log(f"[3/8] Creating folder + file records in MongoDB...")
@@ -231,7 +242,6 @@ def run_upload_pipeline(
     layout_detection_enabled = True
     page_summaries: list[str] = []
     page_ids: list[str] = []
-    qdrant_records: list[dict] = []
     title_block_index: list[dict] = []
 
     for page_info in pages_info:
@@ -268,14 +278,11 @@ def run_upload_pipeline(
             blocks = []
 
         # ── Step 6: Page summary + block processing — run concurrently ─────
-        # marker_page_md: pre-cached from chunked PDF OCR (large docs only)
-        marker_page_md = marker_page_cache.get(page_number)
-        log(f"[6/8] Gemini: page summary + {len(blocks)} blocks in parallel — page {page_number}"
-            + (" [Marker cache hit]" if marker_page_md else "") + "...")
+        log(f"[6/8] Gemini: page summary + {len(blocks)} blocks in parallel — page {page_number}...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _page_executor:
             _summary_future = _page_executor.submit(generate_page_summary, image)
             _blocks_future = _page_executor.submit(
-                process_page_blocks, blocks, image, marker_page_md
+                process_page_blocks, blocks, image
             )
             short_summary = _summary_future.result()
             processed_blocks = _blocks_future.result()
@@ -317,20 +324,8 @@ def run_upload_pipeline(
             blocks=processed_blocks,
         )
 
-        # ── Embedding (Cohere, search_document) ──────────────────────────────
-        vector = embed_text(short_summary, input_type="search_document")
-        qdrant_records.append({
-            "page_id": page_id,
-            "vector": vector,
-            "file_id": file_id,
-            "folder_id": folder_id,
-            "page_number": page_number,
-            "short_summary": short_summary,
-        })
-
-    # ── Step 8: Batch upsert vectors to Qdrant ───────────────────────────────
-    log(f"[8/8] Saving {len(qdrant_records)} vectors to Qdrant...")
-    qdrant_store.upsert_page_vectors_batch(qdrant_records)
+    # ── Step 8: Build summaries ──────────────────────────────────────────────
+    log("[8/8] Finalizing summaries...")
 
     # Build + save file-level summary (full, stored in DB for agent retrieval)
     file_summary = build_file_summary(page_summaries, file_name)
@@ -397,8 +392,6 @@ def _run_marker_text_pipeline(
 
     page_ids: list[str] = []
     page_summaries: list[str] = []
-    qdrant_records: list[dict] = []
-
     for page_number in sorted(marker_pages):
         page_md = str(marker_pages.get(page_number, "") or "").strip()
         if not page_md:
@@ -421,21 +414,7 @@ def _run_marker_text_pipeline(
             context_md=context_md,
             blocks=[],
         )
-        vec_text = page_short if page_short else page_md[:1500]
-        vector = embed_text(vec_text, input_type="search_document")
-        qdrant_records.append(
-            {
-                "page_id": page_id,
-                "vector": vector,
-                "file_id": file_id,
-                "folder_id": folder_id,
-                "page_number": page_number,
-                "short_summary": page_short,
-            }
-        )
-
-    log(f"[4/6] Saving {len(qdrant_records)} vectors to Qdrant...")
-    qdrant_store.upsert_page_vectors_batch(qdrant_records)
+    log("[4/6] Saving extracted pages to MongoDB...")
 
     log("[5/6] Building file/folder summaries...")
     file_summary = build_file_summary(page_summaries, file_name)
@@ -496,6 +475,121 @@ def _convert_doc_to_pdf(source_path: Path, output_dir: Path) -> Path:
     if not pdf_files:
         raise RuntimeError("DOC/DOCX conversion completed but produced no PDF output.")
     return pdf_files[0]
+
+
+def _convert_dwg_to_dxf(source_path: Path, output_dir: Path) -> Path:
+    """Convert DWG to DXF by reusing tools/_archive/dwg_to_dxf_converter.py."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    script_path = Path(__file__).resolve().parents[2] / "tools" / "_archive" / "dwg_to_dxf_converter.py"
+    if not script_path.exists():
+        raise RuntimeError(f"DWG converter script not found: {script_path}")
+
+    spec = importlib.util.spec_from_file_location("cad_archive_dwg_to_dxf", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load converter module spec from: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    convert_fn = getattr(module, "convert", None)
+    if not callable(convert_fn):
+        raise RuntimeError("Converter script does not expose callable convert(dwg, out_dir).")
+
+    converted = convert_fn(source_path, output_dir)
+    if converted is None:
+        raise RuntimeError(
+            "DWG conversion failed via tools/_archive/dwg_to_dxf_converter.py. "
+            "Ensure ODAFileConverter and xvfb-run are installed."
+        )
+    dxf_path = Path(converted)
+    if not dxf_path.exists():
+        raise RuntimeError(f"Converter returned missing DXF path: {dxf_path}")
+    return dxf_path
+
+
+def _persist_dxf_file(dxf_src: Path, *, file_id: str, file_name: str) -> Path:
+    """Persist DXF artifact to stable storage directory for later tool use."""
+    target_dir = LOCAL_ORIGINALS_DIR / file_id / "cad"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    base_name = Path(file_name).stem.strip() or dxf_src.stem.strip() or "drawing"
+    target_path = target_dir / f"{base_name}.dxf"
+    if dxf_src.resolve() != target_path.resolve():
+        shutil.copy2(dxf_src, target_path)
+    return target_path
+
+
+def _run_dxf_single_page_pipeline(
+    *,
+    source_file: Path,
+    dxf_path: Path,
+    file_id: str,
+    file_name: str,
+    folder_id: str,
+    folder_name: str,
+    original_url: str,
+    log: Callable[[str], None],
+) -> dict:
+    """Index a DXF drawing as a single-page CAD file for count tool support."""
+    dxf_path_abs = str(dxf_path.resolve())
+    log("[3/6] Creating folder + file records in MongoDB...")
+    mongo.upsert_folder(folder_id, folder_name)
+    mongo.upsert_file(
+        file_id=file_id,
+        folder_id=folder_id,
+        file_name=file_name,
+        file_url=original_url,
+        total_pages=1,
+        dxf_path=dxf_path_abs,
+    )
+
+    page_id = f"{file_id}_p1"
+    page_short_summary = (
+        f"CAD drawing indexed for counting from DXF source: {Path(dxf_path_abs).name}."
+    )
+    context_md = (
+        "# Page 1\n\n"
+        f"- Source file: {source_file.name}\n"
+        f"- DXF path: {dxf_path_abs}\n"
+        "- This file is indexed as CAD geometry for count workflows."
+    )
+    log("[4/6] Creating DXF-backed page context...")
+    mongo.upsert_page(
+        page_id=page_id,
+        file_id=file_id,
+        folder_id=folder_id,
+        page_number=1,
+        image_url="",
+        short_summary=page_short_summary,
+        context_md=context_md,
+        blocks=[],
+        dxf_path=dxf_path_abs,
+    )
+
+    log("[5/6] Building file/folder summaries...")
+    file_summary = (
+        f"File: {file_name}\n"
+        "Type: CAD drawing (DWG/DXF)\n"
+        f"DXF source: {Path(dxf_path_abs).name}\n"
+        "This file is prepared for geometry-based counting."
+    )
+    mongo.update_file_summary(file_id, file_summary)
+    mongo.update_file_short_summary(file_id, page_short_summary)
+    mongo.update_file_title_block_index(file_id, [])
+
+    all_file_docs = mongo.list_files(folder_id)
+    all_short_summaries = [
+        f.get("short_summary") or f.get("summary", "")
+        for f in all_file_docs
+        if f.get("short_summary") or f.get("summary")
+    ]
+    folder_summary = build_folder_summary(all_short_summaries)
+    mongo.update_folder_summary(folder_id, folder_summary)
+    log("✓ Done!")
+    return {
+        "file_id": file_id,
+        "folder_id": folder_id,
+        "total_pages": 1,
+        "page_ids": [page_id],
+        "original_url": original_url,
+    }
 
 def _upload_block_crops(
     blocks,

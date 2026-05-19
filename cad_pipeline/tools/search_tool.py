@@ -5,11 +5,10 @@ Flow:
   + image bytes (optional)
     → Gemini Flash Vision: describe image in detail
     → enrich query: "<query> <description>"
-  → Cohere embed (search_query, 1024-dim)
-  → Qdrant top-K (filter by folder/file if provided)
-  → Fetch page metadata from MongoDB
+  → title-block deterministic lookup
+  → fallback Mongo lexical page retrieval (no embeddings)
   → Return top-N results with rank, file_name, page_number, image_url,
-    short_summary, vector_score
+    short_summary, vector_score (compat key)
 """
 
 from __future__ import annotations
@@ -27,12 +26,10 @@ from PIL import Image
 from cad_pipeline.config import (
     GEMINI_API_KEY,
     GEMINI_FLASH_MODEL,
-    SIMILARITY_CUTOFF_VECTORSEARCH,
     TOP_K,
     TOP_N,
 )
-from cad_pipeline.core.embeddings import embed_query
-from cad_pipeline.storage import mongo, qdrant_store
+from cad_pipeline.storage import mongo
 
 
 # ── Image description via Gemini Flash Vision ──────────────────────────────
@@ -328,7 +325,7 @@ def run_search_tool(
         folder_id:    Restrict search to a specific folder.
         file_id:      Restrict search to a specific file.
         top_n:        Max results to return (default 10).
-        top_k:        Qdrant candidates (default TOP_K from config).
+        top_k:        Mongo lexical candidates (default TOP_K from config).
         gemini_model: Override Gemini model for image description.
 
     Returns:
@@ -397,45 +394,57 @@ def run_search_tool(
         }
     final_query = " ".join(parts)
 
-    # ── 4. Embed ────────────────────────────────────────────────────────────
-    query_vector = embed_query(final_query)
-
-    # ── 5. Qdrant search ────────────────────────────────────────────────────
+    # ── 4. Lexical fallback retrieval (no embeddings) ──────────────────────
     _top_k = top_k or TOP_K
-    candidates = qdrant_store.search_pages(
-        query_vector=query_vector,
-        top_k=_top_k,
+    candidates = mongo.search_pages_lexical(
+        q=final_query,
+        limit=_top_k,
         folder_id=folder_id,
         file_id=file_id,
     )
-    candidates = [c for c in candidates if c["score"] >= SIMILARITY_CUTOFF_VECTORSEARCH]
 
     if not candidates:
         return {
             "query_used": final_query,
             "image_description": description,
             "title_block_query": title_query,
-            "retrieval_mode": "vector_search",
+            "retrieval_mode": "lexical_search",
             "total": 0,
             "results": [],
         }
 
-    # ── 6. Fetch MongoDB metadata ───────────────────────────────────────────
-    page_ids = [c["page_id"] for c in candidates]
-    pages_data = {p["_id"]: p for p in mongo.get_pages_by_ids(page_ids)}
+    # ── 5. Fetch MongoDB metadata ───────────────────────────────────────────
+
+    # Deduplicate by (file_id, page_number) first so "top_n pages" is truly page-unique.
+    unique_candidates: list[dict] = []
+    seen_page_keys: set[tuple[str, int]] = set()
+    for c in candidates:
+        fid = str(c.get("file_id", "")).strip()
+        try:
+            pno = int(c.get("page_number", 0) or 0)
+        except Exception:
+            pno = 0
+        if not fid or pno <= 0:
+            continue
+        key = (fid, pno)
+        if key in seen_page_keys:
+            continue
+        seen_page_keys.add(key)
+        unique_candidates.append(c)
+        if len(unique_candidates) >= top_n:
+            break
 
     # Batch-fetch folder names to avoid N+1 lookups
-    folder_ids = {c["folder_id"] for c in candidates[:top_n]}
+    folder_ids = {c["folder_id"] for c in unique_candidates}
     folders_map: dict[str, str] = {}
     for fid in folder_ids:
         fol = mongo.get_folder(fid)
         folders_map[fid] = fol.get("name", fid) if fol else fid
 
     results: list[dict] = []
-    for rank, c in enumerate(candidates[:top_n], start=1):
-        page_doc  = pages_data.get(c["page_id"], {})
+    for rank, c in enumerate(unique_candidates, start=1):
         file_doc  = mongo.get_file(c["file_id"]) or {}
-        summary   = page_doc.get("short_summary") or c.get("short_summary", "")
+        summary   = c.get("short_summary", "")
         fol_id    = c.get("folder_id", file_doc.get("folder_id", ""))
         results.append({
             "rank":          rank,
@@ -444,7 +453,7 @@ def run_search_tool(
             "folder_id":     fol_id,
             "folder_name":   folders_map.get(fol_id, fol_id),
             "page_number":   c["page_number"],
-            "image_url":     page_doc.get("image_url", ""),
+            "image_url":     c.get("image_url", ""),
             "short_summary": summary[:200],
             "vector_score":  round(c["score"], 4),
         })
@@ -453,7 +462,7 @@ def run_search_tool(
         "query_used":        final_query,
         "image_description": description,
         "title_block_query": title_query,
-        "retrieval_mode": "vector_search",
+        "retrieval_mode": "lexical_search",
         "total":             len(results),
         "results":           results,
     }

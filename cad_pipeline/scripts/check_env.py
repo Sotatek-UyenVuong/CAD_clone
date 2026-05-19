@@ -86,7 +86,6 @@ def main() -> int:
         ("cv2", ("imread", "imdecode", "imencode")),
         ("fitz", ()),
         ("pymongo", ()),
-        ("qdrant_client", ()),
     )
     for mod_name, attrs in required_module_checks:
         ok, message = _check_module(mod_name, attrs)
@@ -97,7 +96,6 @@ def main() -> int:
     optional_module_checks = (
         ("detectron2", ()),
         ("google.genai", ()),
-        ("cohere", ()),
     )
     for mod_name, attrs in optional_module_checks:
         ok, message = _check_module(mod_name, attrs)
@@ -119,13 +117,11 @@ def main() -> int:
             warnings.append(message)
 
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-    cohere_key = os.getenv("COHERE_API_KEY", "").strip()
     marker_key = os.getenv("MARKER_API_KEY", "").strip()
     database_url = os.getenv("DATABASE_URL", "").strip()
 
     env_checks = (
         ("GEMINI_API_KEY", bool(gemini_key), True),
-        ("COHERE_API_KEY", bool(cohere_key), True),
         ("DATABASE_URL", bool(database_url), True),
         ("MARKER_API_KEY", bool(marker_key), False),
     )

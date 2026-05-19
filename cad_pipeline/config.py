@@ -17,27 +17,13 @@ load_dotenv(dotenv_path=_HERE.parent / ".env", override=False)
 MONGODB_URI: str = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
 MONGODB_DB: str = os.getenv("DATABASE_NAME", "cad_pipeline")
 
-# ── Qdrant ─────────────────────────────────────────────────────────────────
-QDRANT_URL: str = os.getenv("QDRANT_URL", "http://localhost:6333")
-_qdrant_key = os.getenv("QDRANT_API_KEY", "")
-QDRANT_API_KEY: str | None = None if _qdrant_key in ("", "None") else _qdrant_key
-QDRANT_COLLECTION: str = os.getenv("QDRANT_COLLECTION", "cad_pages")
-
 # ── Gemini ─────────────────────────────────────────────────────────────────
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_FLASH_MODEL: str = "gemini-2.5-flash"
 GEMINI_PRO_MODEL: str = "gemini-3.1-pro-preview"
-
-# ── Cohere / Embeddings + Rerank ──────────────────────────────────────────
-COHERE_API_KEY: str = os.getenv("COHERE_API_KEY", "")
-# embed-multilingual-v3.0: 1024-dim, supports Japanese + English
-EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "embed-multilingual-v3.0")
-EMBEDDING_DIM: int = 1024
-COHERE_INPUT_TYPE: str = os.getenv("COHERE_INPUT_TYPE", "search_document")
 # ── Search tuning ──────────────────────────────────────────────────────────
 TOP_K: int = int(os.getenv("TOP_K", "100"))
 TOP_N: int = int(os.getenv("TOP_N", "15"))
-SIMILARITY_CUTOFF_VECTORSEARCH: float = float(os.getenv("SIMILARITY_CUTOFF_VECTORSEARCH", "0.2"))
 
 # ── Layout detection model ─────────────────────────────────────────────────
 PROJECT_ROOT: Path = _HERE.parent

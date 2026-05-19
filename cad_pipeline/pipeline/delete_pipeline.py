@@ -1,22 +1,18 @@
 """delete_pipeline.py — Delete a file or folder from all stores.
 
 File deletion:
-  1. Delete Qdrant vectors (filter by file_id)
-  2. Delete MongoDB pages + file doc
-  3. Rebuild folder summary from remaining files
+  1. Delete MongoDB pages + file doc
+  2. Rebuild folder summary from remaining files
 
 Folder deletion:
-  1. Delete Qdrant vectors for all files in folder
-  2. Delete MongoDB pages + files + folder doc
-  3. Delete chat history for folder
+  1. Delete MongoDB pages + files + folder doc
+  2. Delete chat history for folder
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from cad_pipeline.core.context_builder import build_folder_summary
-from cad_pipeline.storage import mongo, qdrant_store
+from cad_pipeline.storage import mongo
 
 
 def delete_file(file_id: str, folder_id: str) -> dict:
@@ -25,13 +21,10 @@ def delete_file(file_id: str, folder_id: str) -> dict:
     Returns:
         {"file_id": str, "pages_deleted": int, "folder_summary_updated": bool}
     """
-    # 1. Qdrant
-    qdrant_store.delete_file_vectors(file_id)
-
-    # 2. MongoDB pages + file doc
+    # 1. MongoDB pages + file doc
     pages_deleted = mongo.delete_file(file_id)
 
-    # 3. Rebuild folder summary from remaining files
+    # 2. Rebuild folder summary from remaining files
     remaining = mongo.list_files(folder_id)
     if remaining:
         short_summaries = [
@@ -60,15 +53,10 @@ def delete_folder(folder_id: str) -> dict:
     Returns:
         {"folder_id": str, "files_deleted": int, "pages_deleted": int}
     """
-    # 1. Qdrant — delete vectors for each file
-    all_files = mongo.list_files(folder_id)
-    for f in all_files:
-        qdrant_store.delete_file_vectors(f["_id"])
-
-    # 2. MongoDB — pages + files + folder doc
+    # 1. MongoDB — pages + files + folder doc
     result = mongo.delete_folder(folder_id)
 
-    # 3. Chat histories (all users)
+    # 2. Chat histories (all users)
     mongo.delete_chat_histories_by_folder(folder_id)
 
     return {

@@ -15,8 +15,7 @@ Adds:
 
 Checkpoint/resume:
   - A JSON checkpoint file tracks done_pages
-  - Qdrant upsert happens per batch (every N_PARALLEL pages)
-  - On resume: done pages are already in Qdrant, only the interrupted batch is re-processed
+  - On resume: done pages are already in MongoDB, only interrupted pages are re-processed
 """
 
 from __future__ import annotations
@@ -42,7 +41,6 @@ if str(_HERE) not in sys.path:
 
 from cad_pipeline.config import API_BASE_URL, LOCAL_IMAGES_DIR, USE_S3
 from cad_pipeline.core.layout_detect import LayoutBlock, LAYOUT_CLASSES
-from cad_pipeline.core.marker_pdf import marker_ocr_pdf, CHUNK_THRESHOLD
 from cad_pipeline.core.page_processor import process_page_blocks, generate_page_summary
 from cad_pipeline.core.context_builder import (
     build_page_context,
@@ -50,8 +48,7 @@ from cad_pipeline.core.context_builder import (
     build_folder_summary,
     generate_file_short_summary,
 )
-from cad_pipeline.core.embeddings import embed_text
-from cad_pipeline.storage import mongo, qdrant_store
+from cad_pipeline.storage import mongo
 
 # Number of pages to process concurrently
 N_PARALLEL = 10
@@ -202,8 +199,7 @@ def run_upload_rendered(
 ) -> dict:
     """Upload pipeline using pre-rendered images and pre-detected YOLO layout.
 
-    Processes n_parallel pages concurrently. Qdrant upsert happens per batch
-    so resume only needs to re-process the interrupted batch.
+    Processes n_parallel pages concurrently and checkpoints completed pages.
     """
     pdf_path = Path(pdf_path)
     rendered_dir = Path(rendered_dir)
@@ -243,7 +239,6 @@ def run_upload_rendered(
             "file_name": file_name,
             "total_pages": total_pages,
             "done_pages": [],
-            "marker_cache_done": False,
         }
 
     log("[3] Upserting folder + file in MongoDB...")
@@ -256,19 +251,6 @@ def run_upload_rendered(
         total_pages=total_pages,
     )
 
-    marker_page_cache: dict[int, str] = {}
-    if total_pages > CHUNK_THRESHOLD and not ckpt.get("marker_cache_done"):
-        log(f"[2b] Marker chunked OCR for {total_pages} pages...")
-        try:
-            marker_page_cache = marker_ocr_pdf(pdf_path)
-            log(f"[2b] Marker cached {len(marker_page_cache)} pages")
-            ckpt["marker_cache_done"] = True
-            save_checkpoint(checkpoint_path, ckpt)
-        except Exception as exc:
-            log(f"[2b] Marker pre-cache failed ({exc}) — using per-crop fallback")
-    elif ckpt.get("marker_cache_done"):
-        log("[2b] Marker cache already done (checkpoint) — skipping")
-
     _lock = threading.Lock()
 
     def _process_page(png_path: Path) -> tuple[int, dict]:
@@ -280,7 +262,7 @@ def run_upload_rendered(
             return page_number, {
                 "page_id": f"{file_id}_p{page_number}",
                 "short_summary": (stored or {}).get("short_summary", ""),
-                "qdrant_record": None,
+                "indexed": True,
             }
 
         image = _safe_load_image(png_path)
@@ -289,7 +271,7 @@ def run_upload_rendered(
             return page_number, {
                 "page_id": f"{file_id}_p{page_number}",
                 "short_summary": "",
-                "qdrant_record": None,
+                "indexed": False,
             }
 
         img_h, img_w = image.shape[:2]
@@ -298,11 +280,9 @@ def run_upload_rendered(
         txt_path = png_path.with_suffix(".txt")
         blocks = load_blocks_from_yolo_txt(txt_path, img_w, img_h, class_names)
         dxf_path_str: str | None = dxf_map.get(page_idx)
-        marker_page_md = marker_page_cache.get(page_number)
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             f_summary = pool.submit(generate_page_summary, image)
-            f_blocks = pool.submit(process_page_blocks, blocks, image, marker_page_md)
+            f_blocks = pool.submit(process_page_blocks, blocks, image)
             short_summary = f_summary.result()
             processed_blocks = f_blocks.result()
 
@@ -326,26 +306,16 @@ def run_upload_rendered(
             dxf_path=dxf_path_str,
         )
 
-        vector = embed_text(short_summary, input_type="search_document")
-
         with _lock:
             log(
                 f"  ✓ page {page_number}/{total_pages}"
                 + (f" [DXF: {Path(dxf_path_str).name}]" if dxf_path_str else "")
-                + (" [Marker cache]" if marker_page_md else "")
             )
 
         return page_number, {
             "page_id": page_id,
             "short_summary": short_summary,
-            "qdrant_record": {
-                "page_id": page_id,
-                "vector": vector,
-                "file_id": file_id,
-                "folder_id": folder_id,
-                "page_number": page_number,
-                "short_summary": short_summary,
-            },
+            "indexed": True,
         }
 
     all_results: dict[int, dict] = {}
@@ -367,17 +337,7 @@ def run_upload_rendered(
                 page_number, result = fut.result()
                 all_results[page_number] = result
 
-        batch_qdrant = [
-            all_results[n]["qdrant_record"]
-            for n in batch_nums
-            if all_results.get(n, {}).get("qdrant_record") is not None
-        ]
-
-        if batch_qdrant:
-            qdrant_store.upsert_page_vectors_batch(batch_qdrant)
-            log(f"  → Qdrant: upserted {len(batch_qdrant)} vectors")
-
-        new_done = {n for n in batch_nums if all_results.get(n, {}).get("qdrant_record") is not None}
+        new_done = {n for n in batch_nums if bool(all_results.get(n, {}).get("indexed"))}
         done_pages.update(new_done)
         ckpt["done_pages"] = sorted(done_pages)
         save_checkpoint(checkpoint_path, ckpt)

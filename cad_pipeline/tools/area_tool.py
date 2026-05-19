@@ -18,11 +18,42 @@ from cad_pipeline.config import (
     GEMINI_API_KEY,
     GEMINI_FLASH_MODEL,
     GEMINI_PRO_MODEL,
-    SYMBOL_DB_DIR,
 )
 
-UNIT_ROOM_CATALOG_PATH = SYMBOL_DB_DIR / "unit_room_catalog.json"
+_CAD_PIPELINE_DIR = Path(__file__).resolve().parents[1]
+UNIT_ROOM_CATALOG_PATH = _CAD_PIPELINE_DIR / "unit_room_catalog.json"
 TATAMI_TO_M2 = 1.62  # standard conversion
+
+
+def _attach_viz_image_if_positions(
+    result: dict,
+    image_path: str | Path | None,
+) -> dict:
+    """Attach visualization image if area result includes drawable positions."""
+    positions = result.get("positions")
+    if not isinstance(positions, list) or not positions:
+        return result
+    if not image_path:
+        return result
+
+    src = Path(image_path)
+    if not src.exists():
+        return result
+
+    viz_payload = dict(result)
+    viz_payload.setdefault("mode", "vision_pro")
+    viz_payload.setdefault("count", len(positions))
+    viz_payload.setdefault("query", str(result.get("query") or "area"))
+
+    try:
+        from cad_pipeline.tools.viz_tool import draw_count_boxes
+        out_path = draw_count_boxes(image_path=src, count_result=viz_payload)
+        result["image_url"] = str(out_path)
+        result["viz_image_path"] = str(out_path)
+    except Exception:
+        # Do not fail area extraction when visualization fails.
+        pass
+    return result
 
 
 # ── Room catalog (lazy) ────────────────────────────────────────────────────
@@ -248,7 +279,8 @@ def run_area_tool(
         return get_unit_area(unit_label)
 
     if image_path and Path(image_path).exists():
-        return extract_area_from_image(image_path, query)
+        result = extract_area_from_image(image_path, query)
+        return _attach_viz_image_if_positions(result, image_path)
 
     if context_md:
         return extract_area_from_context(context_md, query)

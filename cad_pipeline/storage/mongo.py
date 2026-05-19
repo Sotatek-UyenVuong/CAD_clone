@@ -42,7 +42,9 @@ def _ensure_indexes(db: Database) -> None:
     db["files"].create_index([("folder_id", ASCENDING)])
     db["chat_sessions"].create_index([("folder_id", ASCENDING)])
     db["chat_sessions"].create_index([("user_email", ASCENDING), ("session_id", ASCENDING)])
+    db["chat_history"].create_index([("session_id", ASCENDING)])
     db["chat_history"].create_index([("folder_id", ASCENDING)])
+    db["chat_history"].create_index([("user_email", ASCENDING), ("session_id", ASCENDING)])
     db["chat_history"].create_index([("user_email", ASCENDING), ("folder_id", ASCENDING)])
     db["notifications"].create_index([("user_email", ASCENDING), ("created_at", ASCENDING)])
     db["notifications"].create_index([("user_email", ASCENDING), ("is_read", ASCENDING)])
@@ -252,16 +254,18 @@ CHAT_HISTORY_LIMIT = 5
 
 
 def append_chat_turn(
-    folder_id: str,
+    session_id: str,
     user_message: str,
     assistant_message: str,
+    folder_id: str | None = None,
     user_email: str | None = None,
     user_meta: dict | None = None,
     assistant_meta: dict | None = None,
 ) -> None:
-    """Append a Q&A turn to folder chat history, keeping only the last 5."""
+    """Append a Q&A turn to session chat history, keeping only the last 5."""
     db = get_db()
-    scope_id = f"{user_email}::{folder_id}" if user_email else folder_id
+    scope_id = f"{user_email}::{session_id}" if user_email else session_id
+    resolved_folder_id = str(folder_id or session_id)
     turn = {
         "role_user": user_message,
         "role_assistant": assistant_message,
@@ -279,7 +283,8 @@ def append_chat_turn(
                 }
             },
             "$set": {
-                "folder_id": folder_id,
+                "session_id": session_id,
+                "folder_id": resolved_folder_id,
                 "user_email": user_email,
                 "updated_at": _now(),
             },
@@ -290,18 +295,18 @@ def append_chat_turn(
     # Keep chat_sessions in sync so session list/debugging can rely on a
     # concrete session document even when user never updates source file_ids.
     if user_email is not None:
-        touch_chat_session(session_id=folder_id, folder_id=folder_id, user_email=user_email)
+        touch_chat_session(session_id=session_id, folder_id=resolved_folder_id, user_email=user_email)
 
 
-def get_chat_history(folder_id: str, user_email: str | None = None) -> list[dict]:
-    """Return the last N chat turns for a folder."""
-    scope_id = f"{user_email}::{folder_id}" if user_email else folder_id
+def get_chat_history(session_id: str, user_email: str | None = None) -> list[dict]:
+    """Return the last N chat turns for a session."""
+    scope_id = f"{user_email}::{session_id}" if user_email else session_id
     doc = get_db()["chat_history"].find_one({"_id": scope_id})
     return doc.get("turns", []) if doc else []
 
 
-def delete_chat_history(folder_id: str, user_email: str | None = None) -> None:
-    scope_id = f"{user_email}::{folder_id}" if user_email else folder_id
+def delete_chat_history(session_id: str, user_email: str | None = None) -> None:
+    scope_id = f"{user_email}::{session_id}" if user_email else session_id
     get_db()["chat_history"].delete_one({"_id": scope_id})
 
 
@@ -407,20 +412,23 @@ def list_user_chat_sessions(user_email: str) -> list[dict]:
 
     # Source 2: chat history docs (session had messages, even without explicit sources)
     for doc in db["chat_history"].find({"user_email": user_email}):
+        session_id = str(doc.get("session_id") or "")
         folder_id = str(doc.get("folder_id") or "")
-        if not folder_id:
-            # Backward-compat: derive from scoped _id format "email::folder_id"
+        if not session_id:
+            # Backward-compat: derive from scoped _id format "email::session_id"
             doc_id = str(doc.get("_id", ""))
             if "::" in doc_id:
-                folder_id = doc_id.split("::", 1)[1]
-        if not folder_id:
+                session_id = doc_id.split("::", 1)[1]
+        if not session_id:
             continue
-        rec = merged.get(folder_id)
+        if not folder_id:
+            folder_id = session_id
+        rec = merged.get(session_id)
         cand_ts = doc.get("updated_at") or doc.get("created_at")
         rec_ts = rec.get("updated_at") if rec else None
         if rec is None or (cand_ts is not None and (rec_ts is None or cand_ts > rec_ts)):
-            merged[folder_id] = {
-                "session_id": folder_id,
+            merged[session_id] = {
+                "session_id": session_id,
                 "folder_id": folder_id,
                 "file_ids": [],
                 "session_name": None,
@@ -496,6 +504,83 @@ def get_pages_by_file(
 
 def get_pages_by_ids(page_ids: list[str]) -> list[dict]:
     return list(get_db()["pages"].find({"_id": {"$in": page_ids}}))
+
+
+def search_pages_lexical(
+    q: str,
+    limit: int = 50,
+    folder_id: str | None = None,
+    file_id: str | None = None,
+) -> list[dict]:
+    """Search pages by lexical regex over summary/context (no embeddings)."""
+    db = get_db()
+    q_norm = unicodedata.normalize("NFKC", q).strip()
+    if not q_norm:
+        return []
+    # Guard query explosion: oversized regex payload can trigger Mongo BSON parser errors.
+    q_norm = q_norm[:1200]
+
+    tokens = re.findall(r"\w+", q_norm, flags=re.UNICODE)
+    # Keep lexical pattern bounded and meaningful.
+    tokens = [t[:48] for t in tokens if t][:32]
+    connector = r"[\s　_\-./\\()（）\[\]【】・,:：;；]*"
+    pattern_str = connector.join(re.escape(t) for t in tokens) if tokens else re.escape(q_norm[:256])
+    try:
+        pattern = re.compile(pattern_str, re.IGNORECASE)
+    except re.error:
+        # Fallback to plain escaped prefix if pattern still invalid.
+        pattern = re.compile(re.escape(q_norm[:256]), re.IGNORECASE)
+
+    text_filter: dict = {
+        "$or": [
+            {"short_summary": {"$regex": pattern}},
+            {"context_md": {"$regex": pattern}},
+        ]
+    }
+    scope_filter: dict[str, str] = {}
+    if folder_id:
+        scope_filter["folder_id"] = folder_id
+    if file_id:
+        scope_filter["file_id"] = file_id
+
+    mongo_filter: dict = text_filter if not scope_filter else {"$and": [scope_filter, text_filter]}
+    candidate_limit = max(int(limit) * 8, 80)
+    docs = list(
+        db["pages"].find(
+            mongo_filter,
+            {
+                "_id": 1,
+                "file_id": 1,
+                "folder_id": 1,
+                "page_number": 1,
+                "image_url": 1,
+                "short_summary": 1,
+                "context_md": 1,
+            },
+        ).limit(candidate_limit)
+    )
+
+    ranked: list[dict] = []
+    for doc in docs:
+        summary = str(doc.get("short_summary", ""))
+        context = str(doc.get("context_md", ""))
+        summary_hits = len(pattern.findall(summary))
+        context_hits = len(pattern.findall(context))
+        score = float(summary_hits * 3 + context_hits)
+        if score <= 0:
+            continue
+        ranked.append({
+            "page_id": str(doc.get("_id", "")),
+            "file_id": str(doc.get("file_id", "")),
+            "folder_id": str(doc.get("folder_id", "")),
+            "page_number": int(doc.get("page_number", 0) or 0),
+            "image_url": str(doc.get("image_url", "")),
+            "short_summary": summary,
+            "score": score,
+        })
+
+    ranked.sort(key=lambda item: (-item["score"], item["page_number"]))
+    return ranked[: max(1, int(limit))]
 
 
 # ── Users ──────────────────────────────────────────────────────────────────

@@ -1,100 +1,183 @@
-# CAD Pipeline — Standalone Sub-project
+# CAD Pipeline
 
-Full end-to-end pipeline for indexing and querying Japanese architectural CAD drawings (PDF/images).
+Pipeline index + Q&A cho bản vẽ CAD kiến trúc (PDF/ảnh, có DXF cho tool đếm).
 
----
+## 1) Kiến trúc hiện tại
 
-## Architecture
+```text
+UPLOAD
+file -> render pages -> layout detect -> OCR/vision per block-group
+     -> build context_md + summaries + title_block_index -> MongoDB
 
-```
-UPLOAD FLOW
------------
-File (PDF/image)
-  │
-  ▼
-pdf_to_images.py       → render pages @ 300 DPI
-  │
-  ▼
-layout_detect.py       → Detectron2 model (text / table / diagram / title_block)
-  │
-  ▼
-page_processor.py      → OCR (text/table) + Gemini Pro (diagram/title_block)
-  │
-  ▼
-context_builder.py     → build Markdown context_md per page
-  │
-  ▼
-embeddings.py          → OpenAI text-embedding-3-small
-  │
-  ├─► MongoDB           (page metadata + context_md)
-  └─► Qdrant            (page vector index)
+Q&A (single orchestrator)
+query + history + files + citations + context_summary
+  -> orchestrator chọn 1 action
+  -> executor chạy action
+  -> review-lite finalize hoặc replan
 
-Q&A FLOW
---------
-User Query
-  │
-  ▼
-router.py              → classify: "qa" or "search"
-  │
-  ├─ qa ──► folder_agent → file_agent → page_agent → tools (count/area)
-  └─ search ──► Qdrant search → Gemini re-rank → results
-
-TOOLS
------
-count_tool.py          → count symbols via LLM or symbol_db
-area_tool.py           → calculate floor areas via LLM or unit_room_catalog.json
+SEARCH TOOL
+/tools/search: title-block lookup (nếu có ảnh) -> lexical Mongo fallback
 ```
 
----
+Trạng thái mới:
+- Đã bỏ hoàn toàn vector embedding / Qdrant.
+- `run_qa` dùng `pipeline/qa_orchestrator_pipeline.py`.
+- Orchestrator duy nhất điều hướng toàn bộ flow.
+- Executors thuần: `file_agent`, `page_reason`, `search`, `count`, `area`, `viz`, `report_*`.
+- Prompt tập trung ở `prompts/qa_orchestrator_prompts.py` và `prompts/agent_prompts.py`.
 
-## Setup
+## 2) Setup nhanh
 
 ```bash
-cd cad_pipeline
-cp .env.example .env
-# Fill in GEMINI_API_KEY, OPENAI_API_KEY, MARKER_API_KEY, DATABASE_URL, QDRANT_URL
-
+cd /path/to/CAD_clone
 pip install -r requirements.txt
 ```
 
-> **Marker API**: OCR (text/table blocks) được xử lý qua Datalab.to cloud API.
-> Lấy API key tại https://www.datalab.to → set `MARKER_API_KEY` trong `.env`.
+Tạo `cad_pipeline/.env`:
 
----
+```env
+DATABASE_URL=mongodb://localhost:27017
+DATABASE_NAME=cad_pipeline
 
-## Run the API server
+GEMINI_API_KEY=...
+MARKER_API_KEY=...
+
+USE_S3=false
+API_BASE_URL=http://localhost:8001
+
+TOP_K=100
+TOP_N=15
+PDF_DPI=300
+AGENT_MAX_PAGES=25
+```
+
+Ghi chú:
+- Marker OCR dùng Datalab Marker API (`MARKER_API_KEY`).
+- Khi `USE_S3=false`, ảnh được serve local qua `/images`.
+
+## 3) Chạy backend
 
 ```bash
-cd /path/to/CAD
-python -m cad_pipeline.api.app
-# or
 uvicorn cad_pipeline.api.app:app --host 0.0.0.0 --port 8001 --reload
 ```
 
----
+## 4) Chạy full stack ổn định bằng tmux
 
-## API Endpoints
+```bash
+# Backend
+tmux new-session -d -s cad_clone_api \
+  'cd /path/to/CAD_clone && python -m uvicorn cad_pipeline.api.app:app --host 0.0.0.0 --port 8001 --reload'
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET`  | `/health` | Health check |
-| `POST` | `/upload` | Upload + index a file (async) |
-| `GET`  | `/upload/{job_id}/status` | Check upload progress |
-| `POST` | `/qa` | Ask a question |
-| `POST` | `/search` | Semantic image/diagram search |
-| `GET`  | `/folders` | List all folders |
-| `GET`  | `/folders/{id}/files` | List files in folder |
-| `GET`  | `/files/{id}/pages` | List pages in file |
-| `GET`  | `/tools/count/groups` | List symbol groups |
-| `GET`  | `/tools/count?keyword=valve` | Count symbols by keyword |
-| `GET`  | `/tools/area/units` | All unit types + areas |
-| `GET`  | `/tools/area/units/{label}` | Unit detail with room breakdown |
+# Frontend
+tmux new-session -d -s cad_clone_ui \
+  'cd /path/to/CAD_clone && __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=.ngrok-free.dev VITE_API_BASE_URL=same-origin npm --prefix "/path/to/CAD_clone/Chatbotsysteminterface" run dev -- --host 127.0.0.1 --port 5173'
 
----
+# Ngrok
+tmux new-session -d -s cad_clone_ngrok \
+  'cd /path/to/CAD_clone && ngrok http 5173 --log stdout'
+```
 
-## Quick usage examples
+Lệnh hữu ích:
+- `tmux ls`
+- `tmux attach -t cad_clone_api`
+- `tmux attach -t cad_clone_ui`
+- `tmux attach -t cad_clone_ngrok`
+- Detach không tắt process: `Ctrl+b` rồi `d`
 
-### Upload a PDF
+## 5) Core flows
+
+### Upload flow
+- Persist original (R2 nếu `USE_S3=true`, local nếu `false`).
+- Nếu file là `DWG`:
+  - convert sang `DXF` bằng script `tools/_archive/dwg_to_dxf_converter.py`,
+  - persist DXF vào `cad_pipeline/data/originals/<file_id>/cad/<file_stem>.dxf`,
+  - tạo 1 page context có `dxf_path`,
+  - lưu `files.dxf_path` + `pages.dxf_path` để tool đếm dùng trực tiếp.
+- Nếu file là `DXF`: đi thẳng flow CAD geometry (không render ảnh/PDF).
+- PDF -> page PNG (`pdf_to_images.py`), hoặc marker-text pipeline với file office.
+- Per page:
+  - layout detect (nếu available),
+  - page summary + block processing concurrent,
+  - build `context_md`,
+  - save page vào Mongo.
+- Cuối file:
+  - build `files.summary`, `files.short_summary`,
+  - build `files.title_block_index`,
+  - rebuild `folders.summary`.
+
+### Q&A flow (`POST /qa`)
+- Load history + recent citations + file scope + explicit pages + context summary.
+- Orchestrator chọn một action trong:
+  - `file_agent`, `page_reason`, `search`, `count`, `area`, `viz`,
+  - `report_pdf`, `report_docx`, `report_excel`, `direct_answer`, `finalize`.
+- Chạy executor tương ứng.
+- Review-lite quyết định finalize hoặc replan step kế tiếp.
+- Có loop guard và max steps để tránh lặp vô hạn.
+- Riêng action `count`: nếu không có page scope phù hợp nhưng file có `dxf_path`, hệ thống fallback đếm trực tiếp từ DXF.
+
+### Search flow
+- `run_search`: lexical retrieval trên `short_summary` + `context_md`, optional scope `folder_id`/`file_id`.
+- `run_search_tool`: nếu có ảnh thì ưu tiên title-block lookup; không match mới fallback lexical.
+- Đã thêm guard query/token trong Mongo lexical để tránh lỗi query dài.
+
+## 6) Scope behavior (quan trọng)
+
+- `GET /tools/search/suggest`
+  - Mặc định: global
+  - Có `folder_id`: scope theo folder
+- `POST /tools/search`
+  - Mặc định: global
+  - Có `folder_id`/`file_id`: scope hẹp hơn
+- `POST /qa`
+  - Có thể đi nhánh search hoặc orchestrator QA
+  - Có `session_file_ids` thì giới hạn trong file scope của session
+- `POST /qa/image`
+  - image-only: có thể gọi `run_search_tool` trực tiếp
+  - có query: vào orchestrator `run_qa`
+
+Lưu ý:
+- `GET /files/{file_id}/original` sẽ ưu tiên trả bản DXF cho file CAD (`.dwg`/`.dxf`).
+- Trình duyệt thường không render DXF inline; tab Original có thể hiện tải xuống thay vì preview trực tiếp.
+
+## 7) API endpoints chính
+
+- `GET /health`
+- `POST /upload`
+- `GET /upload/{job_id}/status`
+- `GET /notifications`
+- `PATCH /notifications/{notification_id}/read`
+- `PATCH /notifications/read-all`
+- `POST /qa`
+- `POST /qa/stream`
+- `POST /qa/jobs`
+- `GET /qa/jobs/{job_id}`
+- `POST /qa/image`
+- `POST /qa/image/stream`
+- `POST /search`
+- `POST /tools/search`
+- `GET /tools/search/suggest`
+- `POST /folders`
+- `GET /folders`
+- `GET /folders/{folder_id}/files`
+- `GET /files/{file_id}`
+- `GET /files/{file_id}/pages`
+- `GET /files/{file_id}/pages/{page_number}`
+- `DELETE /files/{file_id}`
+- `DELETE /folders/{folder_id}`
+- `GET /chat-sessions`
+- `GET /chat-sessions/{session_id}`
+- `DELETE /chat-sessions/{session_id}`
+- `GET /tools/count/groups`
+- `GET /tools/count`
+- `GET /tools/area/units`
+- `GET /tools/area/units/{unit_label}`
+- `POST /tools/count/context`
+- `POST /tools/area/context`
+
+## 8) Ví dụ nhanh
+
+Upload:
+
 ```bash
 curl -X POST http://localhost:8001/upload \
   -F "file=@drawing.pdf" \
@@ -102,116 +185,32 @@ curl -X POST http://localhost:8001/upload \
   -F "folder_name=Electrical Drawings"
 ```
 
-### Ask a question
+Q&A:
+
 ```bash
 curl -X POST http://localhost:8001/qa \
   -H "Content-Type: application/json" \
-  -d '{"query": "バルブは何個ありますか？", "folder_id": "folder_001"}'
+  -d '{"query":"EV co bao nhieu cai?","folder_id":"folder_001"}'
 ```
 
-### Search for similar diagrams
+Search:
+
 ```bash
 curl -X POST http://localhost:8001/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "pump diagram with flow arrows", "top_k": 5}'
+  -d '{"query":"stair core 9F","folder_id":"folder_001"}'
 ```
 
-### Count symbols
-```bash
-curl "http://localhost:8001/tools/count?keyword=valve&use_symbol_db=true"
-```
+## 9) Cấu trúc thư mục chính
 
-### Get floor areas
-```bash
-curl "http://localhost:8001/tools/area/units/apt_unit_100A"
-```
-
----
-
-## Python usage
-
-```python
-# Upload
-from cad_pipeline.pipeline.upload_pipeline import run_upload_pipeline
-result = run_upload_pipeline(
-    file_path="drawing.pdf",
-    folder_id="folder_001",
-    folder_name="Electrical Drawings",
-)
-print(result)  # {"file_id": ..., "total_pages": 10, "page_ids": [...]}
-
-# Q&A
-from cad_pipeline.pipeline.qa_pipeline import run_qa
-answer = run_qa(query="総面積はいくらですか？", folder_id="folder_001")
-print(answer["answer"])
-
-# Search
-from cad_pipeline.pipeline.search_pipeline import run_search
-results = run_search(query="emergency exit diagram", top_k=5)
-
-# Count
-from cad_pipeline.tools.count_tool import run_count_tool
-count = run_count_tool(query="valve", use_symbol_db=True)
-print(count)  # {"count": 42, "unique_symbols": 5, ...}
-
-# Area
-from cad_pipeline.tools.area_tool import get_unit_area
-info = get_unit_area("apt_unit_100A")
-print(info["total_m2"])  # e.g. 162.97 m²
-```
-
----
-
-## Project structure
-
-```
+```text
 cad_pipeline/
-├── config.py                  # all configuration from .env
-├── .env.example
-├── requirements.txt
-├── README.md
-├── core/
-│   ├── pdf_to_images.py       # PDF → PNG pages
-│   ├── layout_detect.py       # Detectron2 layout model wrapper
-│   ├── page_processor.py      # OCR + Gemini per block
-│   ├── context_builder.py     # build Markdown context
-│   └── embeddings.py          # OpenAI embeddings
-├── storage/
-│   ├── mongo.py               # MongoDB CRUD
-│   └── qdrant_store.py        # Qdrant vector CRUD
-├── agents/
-│   ├── router.py              # qa vs search classifier
-│   ├── folder_agent.py        # Level 1 agent
-│   ├── file_agent.py          # Level 2 agent
-│   └── page_agent.py          # Core reasoning agent
-├── tools/
-│   ├── count_tool.py          # symbol counting (DB + LLM)
-│   └── area_tool.py           # area calculation (catalog + LLM)
-├── pipeline/
-│   ├── upload_pipeline.py     # full upload flow
-│   ├── qa_pipeline.py         # full Q&A flow
-│   └── search_pipeline.py     # global semantic search
-└── api/
-    └── app.py                 # FastAPI server
+  api/app.py
+  pipeline/{upload_pipeline,qa_orchestrator_pipeline,search_pipeline,delete_pipeline}.py
+  prompts/{qa_orchestrator_prompts,agent_prompts}.py
+  agents/{folder_agent,file_agent,page_agent,tool_router}.py
+  tools/{search_tool,count_tool,area_tool,report_tool,viz_tool}.py
+  core/{pdf_to_images,layout_detect,page_processor,context_builder,marker_pdf}.py
+  storage/{mongo,s3_store}.py
+  config.py
 ```
-
----
-
-## Reused from parent project
-
-| Component | Source |
-|-----------|--------|
-| Layout detection model | `layout_detect/models/checkpoints/cad_layout_v7_swapsplit/model_final.pth` |
-| Symbol database | `symbol_db/symbols_enriched.json` (2723 symbols, 21 groups) |
-| Symbol groups | `symbol_db/symbol_groups.json` |
-| Unit room catalog | `symbol_db/unit_room_catalog.json` |
-
-## OCR Strategy
-
-| Block type | Tool | Notes |
-|------------|------|-------|
-| `text` | Gemini 2.5 Flash vision | Transcribe text exactly as-is |
-| `table` | Marker API (fast mode) | Cloud OCR → Markdown table |
-| `diagram` | Gemini Pro vision | Description in original language |
-| `title_block` | Marker API → Gemini Flash | OCR text → structured JSON |
-| Page summary | Gemini Flash vision | 1-2 sentence overview |

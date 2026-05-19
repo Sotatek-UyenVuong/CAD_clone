@@ -6,7 +6,7 @@ import json
 import re
 
 from cad_pipeline.config import GEMINI_API_KEY, GEMINI_FLASH_MODEL
-from cad_pipeline.agents.language_utils import detect_query_language, language_label
+from cad_pipeline.prompts.agent_prompts import build_file_agent_prompt
 
 
 def run_file_agent(
@@ -15,6 +15,10 @@ def run_file_agent(
     file_name: str,
     file_short_summary: str,
     file_summary: str,
+    context_summary: str | None = None,
+    recent_citations: list[dict] | None = None,
+    explicit_pages_requested: list[int] | None = None,
+    language_context: str | None = None,
 ) -> dict:
     """Run the file-level agent.
 
@@ -36,43 +40,18 @@ def run_file_agent(
     from google import genai  # type: ignore
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    lang = language_label(detect_query_language(query))
 
-    prompt = f"""You are a File-level assistant for a CAD document Q&A system.
-
-File: {file_name} (id={file_id})
-Short summary (quick overview):
-{file_short_summary}
-
-Detailed summary (longer file context):
-{file_summary}
-
-User question: "{query}"
-Detected user language: {lang}
-
-Your tasks:
-1. Decide if the file summaries are sufficient to answer the question
-2. If YES → answer directly
-3. If NO → escalate to page-level analysis
-
-Rules:
-- Use short summary for quick intent matching and detailed summary for content validation
-- ONLY answer directly if the summaries EXPLICITLY contain the exact information needed
-- For ANY question about specific numbers, counts, technical specs, detailed content, drawings, measurements → ALWAYS escalate (go_to_page)
-- Do NOT infer or guess — if uncertain, escalate
-- The summary is an overview only; detailed answers require page-level reading
-- If action is "go_to_page", "candidate_pages" MUST contain the most likely page numbers (up to 8).
-- candidate_pages must be explicit integers in ascending order (example: [3, 7, 12]).
-- If no reliable page candidates are visible from summary, return [].
-- The "answer" field MUST be written in {lang} only.
-
-Reply ONLY as JSON:
-{{
-  "action": "answer" or "go_to_page",
-  "answer": "<answer text, empty if go_to_page>",
-  "reason": "<brief explanation>",
-  "candidate_pages": [<int>, ...]
-}}"""
+    prompt = build_file_agent_prompt(
+        file_name=file_name,
+        file_id=file_id,
+        file_short_summary=file_short_summary,
+        file_summary=file_summary,
+        context_summary=str(context_summary or "").strip(),
+        recent_citations_text=json.dumps(recent_citations or [], ensure_ascii=False),
+        explicit_pages_text=json.dumps(explicit_pages_requested or [], ensure_ascii=False),
+        language_context=str(language_context or "same as user query"),
+        query=query,
+    )
 
     try:
         response = client.models.generate_content(

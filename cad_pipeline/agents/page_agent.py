@@ -30,27 +30,9 @@ from pathlib import Path
 from collections.abc import Callable
 
 from cad_pipeline.config import GEMINI_API_KEY, GEMINI_PRO_MODEL, GEMINI_FLASH_MODEL, AGENT_MAX_PAGES
-from cad_pipeline.agents.language_utils import detect_query_language, language_label
+from cad_pipeline.prompts.agent_prompts import build_page_reasoner_prompt, build_page_selector_prompt
 
 MAX_SELECTED_PAGES = 5
-
-
-def _is_page_lookup_query(query: str) -> bool:
-    q = (query or "").strip().lower()
-    if not q:
-        return False
-    hints = [
-        "page nào",
-        "trang nào",
-        "trang mấy",
-        "ở page",
-        "ở trang",
-        "which page",
-        "what page",
-        "ページ",
-        "何ページ",
-    ]
-    return any(h in q for h in hints)
 
 
 def _rank_pages_by_summary_overlap(query: str, pages: list[dict]) -> list[dict]:
@@ -91,6 +73,97 @@ def _build_citations_from_pages(result_pages_used: list[int], selected_pages: li
             }
         )
     return citations
+
+
+def _build_citations_from_scope_pages(scope_pages: list[dict], target_pages: list[int] | None = None) -> list[dict]:
+    citations: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    target_set = set(target_pages or [])
+    for p in scope_pages:
+        fid = str(p.get("file_id", "")).strip()
+        pno = int(p.get("page_number", 0) or 0)
+        if not fid or pno <= 0:
+            continue
+        if target_set and pno not in target_set:
+            continue
+        key = (fid, pno)
+        if key in seen:
+            continue
+        seen.add(key)
+        citations.append(
+            {
+                "file_id": fid,
+                "file_name": str(p.get("file_name") or fid),
+                "page_number": pno,
+            }
+        )
+    return citations
+
+
+def _select_tool_scope_pages(query: str, used_pages: list[dict]) -> list[dict]:
+    """Choose a single-file page scope before invoking heavy tools.
+
+    When page reasoning returns pages from multiple files, tool execution should
+    not run on an ambiguous mixed-file context.
+    """
+    if not used_pages:
+        return used_pages
+    file_ids = {str(p.get("file_id", "")) for p in used_pages if str(p.get("file_id", "")).strip()}
+    if len(file_ids) <= 1:
+        return used_pages
+
+    q_tokens = [t for t in re.findall(r"\w+", (query or "").lower()) if len(t) >= 2]
+    by_file: dict[str, list[dict]] = {}
+    for p in used_pages:
+        fid = str(p.get("file_id", "")).strip()
+        if not fid:
+            continue
+        by_file.setdefault(fid, []).append(p)
+    if not by_file:
+        return used_pages
+
+    def _score_pages(pages: list[dict]) -> tuple[int, int]:
+        # Primary: number of grounded pages from the same file.
+        page_count = len(pages)
+        # Secondary: lexical overlap with query to break ties.
+        overlap = 0
+        if q_tokens:
+            for p in pages:
+                text = (
+                    str(p.get("short_summary", "") or "") + " " +
+                    str(p.get("context_md", "") or "")[:1200]
+                ).lower()
+                overlap += sum(1 for t in q_tokens if t in text)
+        return page_count, overlap
+
+    best_fid = max(by_file.keys(), key=lambda fid: _score_pages(by_file[fid]))
+    scoped = by_file[best_fid]
+    scoped.sort(key=lambda p: int(p.get("page_number", 0) or 0))
+    return scoped
+
+
+def _extract_layout_hint(query: str, used_pages: list[dict]) -> str | None:
+    """Best-effort floor/layout hint for DXF viewport scoping."""
+    patterns = [
+        r"\bB\d{1,2}F\b",
+        r"\b\d{1,2}F\b",
+        r"\bRF\b",
+        r"\bPH\b",
+        r"地下\d+階",
+        r"\d+階",
+    ]
+    texts = [query]
+    for p in used_pages[:3]:
+        texts.append(str(p.get("short_summary", "") or ""))
+        texts.append(str(p.get("context_md", "") or "")[:1200])
+    corpus = "\n".join(texts)
+    for pat in patterns:
+        m = re.search(pat, corpus, flags=re.I)
+        if not m:
+            continue
+        value = m.group(0).strip()
+        return value.upper() if re.fullmatch(r"[A-Za-z0-9/]+", value) else value
+    return None
 
 
 def _parse_reasoner_json(raw: str) -> dict:
@@ -153,6 +226,9 @@ def _select_pages(
     pages: list[dict],
     client,
     chat_history: list[dict] | None,
+    recent_citations: list[dict] | None = None,
+    context_summary: str | None = None,
+    strict_page_scope: bool = False,
 ) -> list[dict]:
     """Stage 1: Flash selects up to MAX_SELECTED_PAGES most relevant pages."""
     history_text = ""
@@ -162,25 +238,25 @@ def _select_pages(
             lines.append(f"User: {turn['role_user']}")
             lines.append(f"Assistant: {turn['role_assistant']}")
         history_text = "\nPrevious conversation:\n" + "\n".join(lines) + "\n"
+    if context_summary:
+        history_text = f"\nRelevant summarized context:\n{context_summary}\n"
 
     pages_index = "\n".join(
         f"- page={p['page_number']}: {p.get('short_summary', '(no summary)')}"
         for p in pages
     )
+    citations_text = ""
+    if recent_citations:
+        citations_payload = json.dumps(recent_citations, ensure_ascii=False)
+        citations_text = f"\nRecent grounded citations from chat history:\n{citations_payload}\n"
 
-    prompt = f"""You are selecting the most relevant pages from a CAD document to answer a question.
-{history_text}
-Available pages:
-{pages_index}
-
-User question: "{query}"
-
-    Select up to {MAX_SELECTED_PAGES} page numbers (ideally 1–3, max 5) most likely to contain the answer.
-- Prefer pages whose summary mentions the topic directly
-- For count/area questions, include pages with tables or diagrams
-- If unsure, include more rather than fewer
-
-Reply ONLY as JSON: {{"page_numbers": [<int>, ...]}}"""
+    prompt = build_page_selector_prompt(
+        history_text=history_text,
+        citations_text=citations_text,
+        pages_index=pages_index,
+        query=query,
+        max_selected_pages=MAX_SELECTED_PAGES,
+    )
 
     try:
         response = client.models.generate_content(
@@ -192,12 +268,19 @@ Reply ONLY as JSON: {{"page_numbers": [<int>, ...]}}"""
         result = json.loads(raw)
         selected_nums = set(result.get("page_numbers", []))
     except Exception:
-        # Fallback: first MAX_SELECTED_PAGES pages
-        selected_nums = {p["page_number"] for p in pages[:MAX_SELECTED_PAGES]}
+        if strict_page_scope:
+            selected_nums = set()
+        else:
+            # Fallback: first MAX_SELECTED_PAGES pages
+            selected_nums = {p["page_number"] for p in pages[:MAX_SELECTED_PAGES]}
 
     selected = [p for p in pages if p["page_number"] in selected_nums]
-    # Always return at least 1 page
-    return selected or pages[:1]
+    if selected:
+        return selected
+    if strict_page_scope:
+        return []
+    # Default fallback for non-strict mode.
+    return pages[:1]
 
 
 def run_page_agent(
@@ -205,10 +288,14 @@ def run_page_agent(
     pages: list[dict],
     use_tools: bool = True,
     chat_history: list[dict] | None = None,
+    recent_citations: list[dict] | None = None,
+    context_summary: str | None = None,
+    language_context: str | None = None,
     folder_id: str | None = None,
     file_id: str | None = None,
     image_bytes: bytes | None = None,
     answer_stream_callback: Callable[[str], None] | None = None,
+    strict_page_scope: bool = False,
 ) -> dict:
     """Two-stage page-level reasoning agent.
 
@@ -218,6 +305,9 @@ def run_page_agent(
                       image_url, short_summary}.
         use_tools:    Whether to automatically invoke count/area/search tools.
         chat_history: Last N chat turns for context continuity.
+        recent_citations: Structured file/page citations from recent turns.
+        context_summary: LLM-condensed context for current query grounding.
+        language_context: Shared language decided upstream by first agent.
         folder_id:    Folder scope — passed to search_tool when triggered.
         file_id:      File scope — passed to search_tool when triggered.
         image_bytes:  Optional image bytes uploaded by user — passed to
@@ -229,13 +319,44 @@ def run_page_agent(
     from google import genai  # type: ignore
     from cad_pipeline.agents.tool_router import classify_tool
 
+    lang = str(language_context or "en").strip().lower()
+    if lang not in {"vi", "ja", "en"}:
+        lang = "en"
+
+    def _lmsg(vi: str, ja: str, en: str) -> str:
+        if lang == "vi":
+            return vi
+        if lang == "ja":
+            return ja
+        return en
+
     client = genai.Client(api_key=GEMINI_API_KEY)
     pages = pages[:AGENT_MAX_PAGES]
-    lang_code = detect_query_language(query)
-    lang = language_label(lang_code)
 
     # ── Stage 1: Flash selects top pages ────────────────────────────────────
-    selected_pages = _select_pages(query, pages, client, chat_history)
+    selected_pages = _select_pages(
+        query=query,
+        pages=pages,
+        client=client,
+        chat_history=chat_history,
+        recent_citations=recent_citations,
+        context_summary=context_summary,
+        strict_page_scope=strict_page_scope,
+    )
+    if strict_page_scope and not selected_pages:
+        return {
+            "answer": _lmsg(
+                "Không thể xác định đúng phạm vi trang theo yêu cầu trong lịch sử hội thoại hiện tại.",
+                "現在の会話履歴では要求されたページ範囲を正しく特定できませんでした。",
+                "Could not resolve the required page scope from current chat history.",
+            ),
+            "pages_used": [],
+            "images": [],
+            "tool_result": {"mode": "strict_page_scope_unresolved"},
+            "need_tool": "none",
+            "selected_pages": [],
+            "citations": [],
+        }
 
     tool_result: dict | None = None
 
@@ -247,6 +368,12 @@ def run_page_agent(
             turns.append(f"User: {turn['role_user']}")
             turns.append(f"Assistant: {turn['role_assistant']}")
         history_text = "\nPrevious conversation:\n" + "\n".join(turns) + "\n"
+    if context_summary:
+        history_text = f"\nRelevant summarized context:\n{context_summary}\n"
+    citations_text = ""
+    if recent_citations:
+        citations_payload = json.dumps(recent_citations, ensure_ascii=False)
+        citations_text = f"\nRecent grounded citations from chat history:\n{citations_payload}\n"
 
     pages_text = ""
     for p in selected_pages:
@@ -257,30 +384,13 @@ def run_page_agent(
             f"Content:\n{p.get('context_md', '')}"
         )
 
-    prompt = f"""You are a Page-level assistant for a CAD architectural drawing Q&A system.
-{history_text}
-You have access to the following document pages (full content):
-{pages_text}
-
-User question: "{query}"
-Detected user language: {lang}
-
-Tasks:
-1. Answer accurately using the page content above.
-2. Cite the page numbers used.
-3. Say clearly if the content doesn't contain the answer.
-4. Suggest whether a specialist tool is needed.
-
-Do NOT hallucinate content not in the pages.
-The "answer" text MUST be in {lang} only.
-
-Reply ONLY as JSON:
-{{
-  "answer": "<detailed answer in the same language as the question>",
-  "pages_used": [<page_number>, ...],
-  "images": ["<image_url if relevant>", ...],
-  "need_tool": "none" | "search" | "count" | "area" | "viz" | "report_pdf" | "report_docx" | "report_excel"
-}}"""
+    prompt = build_page_reasoner_prompt(
+        history_text=history_text,
+        citations_text=citations_text,
+        pages_text=pages_text,
+        query=query,
+        lang=lang,
+    )
 
     try:
         if answer_stream_callback is not None:
@@ -381,7 +491,8 @@ Reply ONLY as JSON:
     # ── Dispatch tools that benefit from Stage 2 context ───────────────────
     used_nums  = set(result.get("pages_used", []))
     used_pages = [p for p in selected_pages if p["page_number"] in used_nums] or selected_pages
-    combined_ctx = "\n\n".join(p.get("context_md", "") for p in used_pages)
+    tool_scope_pages = _select_tool_scope_pages(query, used_pages)
+    combined_ctx = "\n\n".join(p.get("context_md", "") for p in tool_scope_pages)
 
     if need_tool == "search":
         from cad_pipeline.tools.search_tool import run_search_tool
@@ -391,57 +502,56 @@ Reply ONLY as JSON:
         )
         hits = tool_result.get("results", [])
         if hits:
+            def _norm_name(value: object) -> str:
+                text = str(value or "").strip().lower()
+                text = re.sub(r"\s+", " ", text)
+                text = re.sub(r"[‐‑‒–—―]", "-", text)
+                return text
+
+            file_id_by_name: dict[str, str] = {}
+            for p in pages:
+                fid = str(p.get("file_id", "")).strip()
+                fname = str(p.get("file_name", "")).strip()
+                key = _norm_name(fname)
+                if fid and key and key not in file_id_by_name:
+                    file_id_by_name[key] = fid
             answer_lines = []
             if tool_result.get("image_description"):
                 answer_lines.append(
-                    f"*{'Mô tả ảnh' if lang_code == 'vi' else '画像説明' if lang_code == 'ja' else 'Image description'}:* "
+                    f"*{_lmsg('Mô tả ảnh', '画像説明', 'Image description')}:* "
                     f"{tool_result['image_description']}\n"
                 )
             answer_lines.append(
-                f"**{'Top ' + str(len(hits)) + ' trang liên quan' if lang_code == 'vi' else '関連ページ上位 ' + str(len(hits)) + ' 件' if lang_code == 'ja' else 'Top ' + str(len(hits)) + ' relevant pages'}:**"
+                f"**{_lmsg('Top', '上位', 'Top')} {len(hits)} {_lmsg('trang liên quan', '関連ページ', 'relevant pages')}:**"
             )
             for h in hits:
-                page_word = "trang" if lang_code == "vi" else "ページ" if lang_code == "ja" else "page"
+                page_word = _lmsg("trang", "ページ", "page")
                 answer_lines.append(f"- **{h['file_name']}** {page_word} {h['page_number']} (score {h['vector_score']:.3f}): {h['short_summary'][:120]}")
             result["answer"] = "\n".join(answer_lines)
-        else:
-            if _is_page_lookup_query(query):
-                fallback_pages = _rank_pages_by_summary_overlap(query, selected_pages)[:3]
-                if fallback_pages:
-                    page_word = "trang" if lang_code == "vi" else "ページ" if lang_code == "ja" else "page"
-                    intro = (
-                        "Không thấy kết quả semantic đủ rõ, nhưng theo tóm tắt trang hiện có, nội dung có thể nằm ở:"
-                        if lang_code == "vi"
-                        else "セマンティック検索で十分な一致はありませんでしたが、ページ要約からは次のページが有力です:"
-                        if lang_code == "ja"
-                        else "No confident semantic match was found, but based on available page summaries, the content is likely on:"
-                    )
-                    lines = [
-                        f"- **{p.get('file_name', p.get('file_id', ''))}** {page_word} {p.get('page_number', '?')}: {str(p.get('short_summary', '') or '')[:120]}"
-                        for p in fallback_pages
-                    ]
-                    result["answer"] = "\n".join([intro, *lines])
-                    result["pages_used"] = [
-                        int(p.get("page_number"))
-                        for p in fallback_pages
-                        if isinstance(p.get("page_number"), int) or str(p.get("page_number", "")).isdigit()
-                    ]
-                else:
-                    result["answer"] = (
-                        "Không tìm thấy trang liên quan."
-                        if lang_code == "vi"
-                        else "関連ページが見つかりませんでした。"
-                        if lang_code == "ja"
-                        else "No relevant pages found."
-                    )
-            else:
-                result["answer"] = (
-                    "Không tìm thấy trang liên quan."
-                    if lang_code == "vi"
-                    else "関連ページが見つかりませんでした。"
-                    if lang_code == "ja"
-                    else "No relevant pages found."
+            citations: list[dict] = []
+            seen: set[tuple[str, int]] = set()
+            for h in hits:
+                page_number = int(h.get("page_number", 0) or 0)
+                file_name = str(h.get("file_name", h.get("file_id", ""))).strip()
+                fid = str(h.get("file_id", "")).strip()
+                if not fid:
+                    fid = file_id_by_name.get(_norm_name(file_name), "")
+                if not fid or page_number <= 0:
+                    continue
+                key = (fid, page_number)
+                if key in seen:
+                    continue
+                seen.add(key)
+                citations.append(
+                    {
+                        "file_id": fid,
+                        "file_name": file_name or fid,
+                        "page_number": page_number,
+                    }
                 )
+            result["citations"] = citations
+        else:
+            result["answer"] = _lmsg("Không tìm thấy trang liên quan.", "関連ページが見つかりませんでした。", "No relevant pages found.")
 
     if need_tool == "count":
         from cad_pipeline.tools.count_tool import run_count_tool
@@ -452,15 +562,44 @@ Reply ONLY as JSON:
             _tmp.write(image_bytes); _tmp.close()
             _img_path = _tmp.name
         # If user uploaded an image, prioritize counting on that image instead of DXF/page context.
-        dxf_path = None if _img_path else next((p.get("dxf_path") for p in used_pages if p.get("dxf_path")), None)
+        dxf_path = None if _img_path else next((p.get("dxf_path") for p in tool_scope_pages if p.get("dxf_path")), None)
+        layout_hint = _extract_layout_hint(query, tool_scope_pages) if dxf_path else None
         tool_result = run_count_tool(
             query=query, dxf_path=dxf_path, context_md=combined_ctx,
             image_path=_img_path,
+            layout_hint=layout_hint,
         )
+        if tool_scope_pages:
+            tool_result["target_file_id"] = str(tool_scope_pages[0].get("file_id", "")).strip()
+            tool_result["target_pages"] = sorted(
+                {
+                    int(p.get("page_number", 0) or 0)
+                    for p in tool_scope_pages
+                    if int(p.get("page_number", 0) or 0) > 0
+                }
+            )
         count_value = tool_result.get("count")
         if count_value is not None:
-            label = "Kết quả đếm" if lang_code == "vi" else "カウント結果" if lang_code == "ja" else "Count result"
+            label = _lmsg("Kết quả đếm", "カウント結果", "Count result")
             result["answer"] += f"\n\n**{label}:** {count_value} — {tool_result.get('details', '')}"
+        target_pages = [
+            int(p)
+            for p in (tool_result.get("target_pages") or [])
+            if isinstance(p, int) and p > 0
+        ]
+        if not target_pages:
+            target_pages = sorted(
+                {
+                    int(p.get("page_number", 0) or 0)
+                    for p in tool_scope_pages
+                    if int(p.get("page_number", 0) or 0) > 0
+                }
+            )
+        if target_pages:
+            result["pages_used"] = target_pages
+            citations = _build_citations_from_scope_pages(tool_scope_pages, target_pages=target_pages)
+            if citations:
+                result["citations"] = citations
 
     elif need_tool == "area":
         from cad_pipeline.tools.area_tool import run_area_tool
@@ -472,12 +611,39 @@ Reply ONLY as JSON:
         tool_result = run_area_tool(
             query=query, image_path=_img_path, context_md=combined_ctx,
         )
+        if tool_scope_pages:
+            tool_result["target_file_id"] = str(tool_scope_pages[0].get("file_id", "")).strip()
+            tool_result["target_pages"] = sorted(
+                {
+                    int(p.get("page_number", 0) or 0)
+                    for p in tool_scope_pages
+                    if int(p.get("page_number", 0) or 0) > 0
+                }
+            )
         area_value = tool_result.get("area")
         if area_value is None:
             area_value = tool_result.get("total_m2")
         if area_value is not None:
-            label = "Kết quả diện tích" if lang_code == "vi" else "面積結果" if lang_code == "ja" else "Area result"
+            label = _lmsg("Kết quả diện tích", "面積結果", "Area result")
             result["answer"] += f"\n\n**{label}:** {area_value} {tool_result.get('unit', 'm²')} — {tool_result.get('details', '')}"
+        target_pages = [
+            int(p)
+            for p in (tool_result.get("target_pages") or [])
+            if isinstance(p, int) and p > 0
+        ]
+        if not target_pages:
+            target_pages = sorted(
+                {
+                    int(p.get("page_number", 0) or 0)
+                    for p in tool_scope_pages
+                    if int(p.get("page_number", 0) or 0) > 0
+                }
+            )
+        if target_pages:
+            result["pages_used"] = target_pages
+            citations = _build_citations_from_scope_pages(tool_scope_pages, target_pages=target_pages)
+            if citations:
+                result["citations"] = citations
 
     elif need_tool == "report_pdf":
         from cad_pipeline.tools.report_tool import run_report_pdf
@@ -487,20 +653,16 @@ Reply ONLY as JSON:
         ]
         tool_result = run_report_pdf(query=query, pages=_pages_enriched, tool_result=None)
         if tool_result.get("success"):
-            result["answer"] = (
-                f"Đã tạo báo cáo PDF: **{tool_result['file_name']}**"
-                if lang_code == "vi"
-                else f"PDFレポートを作成しました: **{tool_result['file_name']}**"
-                if lang_code == "ja"
-                else f"Generated PDF report: **{tool_result['file_name']}**"
+            result["answer"] = _lmsg(
+                f"Đã tạo báo cáo PDF: **{tool_result['file_name']}**",
+                f"PDFレポートを作成しました: **{tool_result['file_name']}**",
+                f"Generated PDF report: **{tool_result['file_name']}**",
             )
         else:
-            result["answer"] = (
-                f"Lỗi tạo PDF: {tool_result.get('error')}"
-                if lang_code == "vi"
-                else f"PDF作成エラー: {tool_result.get('error')}"
-                if lang_code == "ja"
-                else f"PDF generation error: {tool_result.get('error')}"
+            result["answer"] = _lmsg(
+                f"Lỗi tạo PDF: {tool_result.get('error')}",
+                f"PDF作成エラー: {tool_result.get('error')}",
+                f"PDF generation error: {tool_result.get('error')}",
             )
 
     elif need_tool == "report_docx":
@@ -511,20 +673,16 @@ Reply ONLY as JSON:
         ]
         tool_result = run_report_docx(query=query, pages=_pages_enriched, tool_result=None)
         if tool_result.get("success"):
-            result["answer"] = (
-                f"Đã tạo báo cáo DOCX: **{tool_result['file_name']}**"
-                if lang_code == "vi"
-                else f"DOCXレポートを作成しました: **{tool_result['file_name']}**"
-                if lang_code == "ja"
-                else f"Generated DOCX report: **{tool_result['file_name']}**"
+            result["answer"] = _lmsg(
+                f"Đã tạo báo cáo DOCX: **{tool_result['file_name']}**",
+                f"DOCXレポートを作成しました: **{tool_result['file_name']}**",
+                f"Generated DOCX report: **{tool_result['file_name']}**",
             )
         else:
-            result["answer"] = (
-                f"Lỗi tạo DOCX: {tool_result.get('error')}"
-                if lang_code == "vi"
-                else f"DOCX作成エラー: {tool_result.get('error')}"
-                if lang_code == "ja"
-                else f"DOCX generation error: {tool_result.get('error')}"
+            result["answer"] = _lmsg(
+                f"Lỗi tạo DOCX: {tool_result.get('error')}",
+                f"DOCX作成エラー: {tool_result.get('error')}",
+                f"DOCX generation error: {tool_result.get('error')}",
             )
 
     elif need_tool == "report_excel":
@@ -541,26 +699,23 @@ Reply ONLY as JSON:
             chat_history=chat_history,
         )
         if tool_result.get("success"):
-            result["answer"] = (
-                f"Đã tạo file Excel: **{tool_result['file_name']}**"
-                if lang_code == "vi"
-                else f"Excelファイルを作成しました: **{tool_result['file_name']}**"
-                if lang_code == "ja"
-                else f"Generated Excel file: **{tool_result['file_name']}**"
+            result["answer"] = _lmsg(
+                f"Đã tạo file Excel: **{tool_result['file_name']}**",
+                f"Excelファイルを作成しました: **{tool_result['file_name']}**",
+                f"Generated Excel file: **{tool_result['file_name']}**",
             )
         else:
-            result["answer"] = (
-                f"Lỗi tạo Excel: {tool_result.get('error')}"
-                if lang_code == "vi"
-                else f"Excel作成エラー: {tool_result.get('error')}"
-                if lang_code == "ja"
-                else f"Excel generation error: {tool_result.get('error')}"
+            result["answer"] = _lmsg(
+                f"Lỗi tạo Excel: {tool_result.get('error')}",
+                f"Excel作成エラー: {tool_result.get('error')}",
+                f"Excel generation error: {tool_result.get('error')}",
             )
 
     result["tool_result"] = tool_result
     result["selected_pages"] = [p["page_number"] for p in selected_pages]
-    result["citations"] = _build_citations_from_pages(
-        result.get("pages_used", []),
-        selected_pages,
-    )
+    if not isinstance(result.get("citations"), list) or not result.get("citations"):
+        result["citations"] = _build_citations_from_pages(
+            result.get("pages_used", []),
+            selected_pages,
+        )
     return result

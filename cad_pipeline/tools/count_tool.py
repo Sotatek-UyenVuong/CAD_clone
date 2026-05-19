@@ -28,6 +28,47 @@ from cad_pipeline.config import (
 )
 
 
+def _attach_viz_image(
+    result: dict,
+    image_path: str | Path | None,
+    dxf_path: str | Path | None = None,
+) -> dict:
+    """Attach a visualization image when result contains drawable positions."""
+    positions = result.get("positions")
+    if not isinstance(positions, list) or not positions:
+        return result
+    if not image_path:
+        return result
+
+    src = Path(image_path)
+    if not src.exists():
+        return result
+
+    try:
+        from cad_pipeline.tools.viz_tool import draw_count_boxes, get_viewport_bounds_from_dxf
+    except Exception:
+        return result
+
+    viewport_bounds = result.get("viewport_bounds")
+    if viewport_bounds is None and dxf_path:
+        dxf_src = Path(dxf_path)
+        if dxf_src.exists():
+            viewport_bounds = get_viewport_bounds_from_dxf(dxf_src)
+
+    try:
+        out_path = draw_count_boxes(
+            image_path=src,
+            count_result=result,
+            viewport_bounds=viewport_bounds,
+        )
+        result["image_url"] = str(out_path)
+        result["viz_image_path"] = str(out_path)
+    except Exception:
+        # Keep counting response resilient even if visualization fails.
+        pass
+    return result
+
+
 # ── Symbol database (lazy) ─────────────────────────────────────────────────
 
 _symbols_cache: dict | None = None
@@ -344,13 +385,25 @@ Reply ONLY as a JSON array of the labels to keep. Example:
         return candidate_labels
 
 
-def _collect_text_positions(msp, query: str, matched_groups: list[str]) -> list[dict]:
+def _collect_text_positions(
+    msp,
+    query: str,
+    matched_groups: list[str],
+    viewport_bounds: dict | None = None,
+) -> list[dict]:
     """Scan modelspace TEXT/MTEXT entities matching query + group keywords."""
     groups_db = _load_groups()
     search_terms = list(dict.fromkeys(
         [query.upper()] +
         [kw.upper() for g in matched_groups for kw in groups_db.get(g, {}).get("keywords", [])]
     ))
+    if viewport_bounds:
+        x_min = float(viewport_bounds.get("x_min", 0.0))
+        x_max = float(viewport_bounds.get("x_max", 0.0))
+        y_min = float(viewport_bounds.get("y_min", 0.0))
+        y_max = float(viewport_bounds.get("y_max", 0.0))
+    else:
+        x_min = x_max = y_min = y_max = 0.0
 
     raw_hits: list[tuple[str, float, float]] = []
     for entity in msp:
@@ -361,7 +414,11 @@ def _collect_text_positions(msp, query: str, matched_groups: list[str]) -> list[
             t_clean = re.sub(r"\\[A-Za-z0-9;]+", "", t.strip()).replace("\\P", " ").strip()
             if not any(st in t_clean.upper() for st in search_terms):
                 continue
-            raw_hits.append((t_clean, entity.dxf.insert.x, entity.dxf.insert.y))
+            ex = float(entity.dxf.insert.x)
+            ey = float(entity.dxf.insert.y)
+            if viewport_bounds and not (x_min <= ex <= x_max and y_min <= ey <= y_max):
+                continue
+            raw_hits.append((t_clean, ex, ey))
         except Exception:
             pass
 
@@ -389,6 +446,7 @@ def count_in_dxf(
     dxf_path: str | Path,
     query: str,
     block_names: set[str] | None = None,
+    viewport_bounds: dict | None = None,
 ) -> dict:
     """Đếm INSERT entity trong file DXF có block_name khớp symbol DB."""
     try:
@@ -401,10 +459,28 @@ def count_in_dxf(
 
     doc = ezdxf.readfile(str(dxf_path))
     msp = doc.modelspace()
+    if viewport_bounds:
+        x_min = float(viewport_bounds.get("x_min", 0.0))
+        x_max = float(viewport_bounds.get("x_max", 0.0))
+        y_min = float(viewport_bounds.get("y_min", 0.0))
+        y_max = float(viewport_bounds.get("y_max", 0.0))
+
+        def _in_scope(entity) -> bool:
+            try:
+                ex = float(entity.dxf.insert.x)
+                ey = float(entity.dxf.insert.y)
+            except Exception:
+                return False
+            return x_min <= ex <= x_max and y_min <= ey <= y_max
+    else:
+        def _in_scope(entity) -> bool:
+            return True
 
     counts_per_block: dict[str, int] = {}
     if block_names:
         for entity in msp.query("INSERT"):
+            if not _in_scope(entity):
+                continue
             name = entity.dxf.name
             if name in block_names:
                 counts_per_block[name] = counts_per_block.get(name, 0) + 1
@@ -423,6 +499,8 @@ def count_in_dxf(
         ]
         insert_positions = []
         for entity in msp.query("INSERT"):
+            if not _in_scope(entity):
+                continue
             if entity.dxf.name in counts_per_block:
                 try:
                     insert_positions.append({
@@ -435,7 +513,12 @@ def count_in_dxf(
                     pass
 
         matched_groups = [s["group"] for s in find_symbols_by_query(query)]
-        text_positions = _collect_text_positions(msp, query, list(dict.fromkeys(matched_groups)))
+        text_positions = _collect_text_positions(
+            msp,
+            query,
+            list(dict.fromkeys(matched_groups)),
+            viewport_bounds=viewport_bounds,
+        )
         all_positions = insert_positions + text_positions
         final_count = max(total, len(text_positions)) if text_positions else total
 
@@ -448,6 +531,7 @@ def count_in_dxf(
             "positions": all_positions,
             "dxf_file": Path(dxf_path).name,
             "mode": "dxf_exact",
+            "viewport_bounds": viewport_bounds,
             "details": (
                 f"INSERT: {total}, TEXT labels: {len(text_positions)} → total: {final_count} "
                 f"in {Path(dxf_path).name}"
@@ -486,6 +570,8 @@ def count_in_dxf(
 
     composite_counts: dict[str, int] = {}
     for entity in msp.query("INSERT"):
+        if not _in_scope(entity):
+            continue
         bname = entity.dxf.name
         if bname in ev_block_dict:
             composite_counts[bname] = composite_counts.get(bname, 0) + 1
@@ -496,6 +582,8 @@ def count_in_dxf(
     text_hits: list[str] = []
     for entity in msp:
         if entity.dxftype() not in ("TEXT", "MTEXT"):
+            continue
+        if not _in_scope(entity):
             continue
         try:
             t = (entity.dxf.text if entity.dxftype() == "TEXT" else entity.text).strip()
@@ -518,6 +606,8 @@ def count_in_dxf(
         ]
         positions = []
         for entity in msp.query("INSERT"):
+            if not _in_scope(entity):
+                continue
             if entity.dxf.name in composite_counts:
                 try:
                     positions.append({
@@ -535,6 +625,7 @@ def count_in_dxf(
             "positions": positions,
             "dxf_file": Path(dxf_path).name,
             "mode": "dxf_symbol_dict",
+            "viewport_bounds": viewport_bounds,
             "details": (
                 f"Found {composite_total} INSERT(s) of composite symbol blocks "
                 f"containing '{query}' text in {Path(dxf_path).name}"
@@ -546,6 +637,8 @@ def count_in_dxf(
         positions_text = []
         for entity in msp:
             if entity.dxftype() not in ("TEXT", "MTEXT"):
+                continue
+            if not _in_scope(entity):
                 continue
             try:
                 t = (entity.dxf.text if entity.dxftype() == "TEXT" else entity.text).strip()
@@ -575,6 +668,7 @@ def count_in_dxf(
             "positions": positions_text,
             "dxf_file": Path(dxf_path).name,
             "mode": "dxf_text_label",
+            "viewport_bounds": viewport_bounds,
             "details": (
                 f"Found {text_total} unique '{query}' TEXT label(s) "
                 f"in {Path(dxf_path).name}: {unique_text_labels[:10]}"
@@ -587,6 +681,7 @@ def count_in_dxf(
         "matched_symbols": [],
         "dxf_file": Path(dxf_path).name,
         "mode": "dxf_exact",
+        "viewport_bounds": viewport_bounds,
         "details": f"No INSERT or TEXT matching '{query}' found in {Path(dxf_path).name}",
     }
 
@@ -688,6 +783,11 @@ Page context:
 
 Task:
 - Determine the best count answer for the query using ONLY the context text above.
+- Match by meaning, not exact token.
+  Example: if query is Vietnamese "cầu thang", terms like Japanese "階段" / "避難階段"
+  or English "stair / staircase / emergency stair" are equivalent and should be counted.
+- If an entity appears as a labeled instance (e.g. "避難階段(1)"), treat it as one instance.
+- If the context implies at least one clear instance, count must be >= 1.
 - If the context does not contain enough information, return count=0 and explain briefly.
 - Do not hallucinate values.
 
@@ -716,6 +816,15 @@ Reply ONLY as JSON:
         confidence = str(parsed.get("confidence", "low"))
         if confidence not in {"high", "medium", "low"}:
             confidence = "low"
+        # Guard against strict-token false negatives:
+        # if details says equivalent term exists once, do not keep count=0.
+        if count == 0:
+            dnorm = details.lower()
+            if (
+                ("once" in dnorm or "1" in dnorm or "một" in dnorm)
+                and ("階段" in details or "避難階段" in details or "stair" in dnorm)
+            ):
+                count = 1
         return {
             "count": max(count, 0),
             "query": query,
@@ -739,15 +848,53 @@ def run_count_tool(
     image_path: str | Path | None = None,
     context_md: str | None = None,
     use_symbol_db: bool = True,
+    layout_hint: str | None = None,
 ) -> dict:
     """Main entry point cho count tool."""
     _ = use_symbol_db  # Backward-compatible argument; current DXF flow always uses symbol DB first.
 
     if dxf_path and Path(dxf_path).exists():
-        return count_in_dxf(dxf_path, query)
+        viewport_bounds = None
+        if layout_hint:
+            try:
+                from cad_pipeline.tools.viz_tool import get_viewport_bounds_from_dxf
+                viewport_bounds = get_viewport_bounds_from_dxf(dxf_path, layout_name=layout_hint)
+            except Exception:
+                viewport_bounds = None
+        # Strict page/layout-scoped DXF counting:
+        # do NOT fallback to global modelspace counting when viewport cannot be resolved.
+        if viewport_bounds is None:
+            if context_md and context_md.strip():
+                fallback = count_in_context_md(query, context_md)
+                fallback["mode"] = "context_md_scope_fallback"
+                fallback["details"] = (
+                    f"DXF scoped count skipped: cannot resolve layout viewport"
+                    f"{f' for hint {layout_hint!r}' if layout_hint else ''}. "
+                    f"Falling back to page context."
+                )
+                if layout_hint:
+                    fallback["layout_hint"] = layout_hint
+                return fallback
+            return {
+                "count": 0,
+                "query": query,
+                "matched_symbols": [],
+                "dxf_file": Path(dxf_path).name,
+                "mode": "dxf_scope_missing",
+                "layout_hint": layout_hint or "",
+                "details": (
+                    "DXF scoped count skipped because viewport/layout scope could not be resolved."
+                ),
+            }
+
+        result = count_in_dxf(dxf_path, query, viewport_bounds=viewport_bounds)
+        if layout_hint:
+            result["layout_hint"] = layout_hint
+        return _attach_viz_image(result, image_path=image_path, dxf_path=dxf_path)
 
     if image_path and Path(image_path).exists():
-        return count_in_image(image_path, query)
+        result = count_in_image(image_path, query)
+        return _attach_viz_image(result, image_path=image_path, dxf_path=None)
 
     if context_md and context_md.strip():
         return count_in_context_md(query, context_md)

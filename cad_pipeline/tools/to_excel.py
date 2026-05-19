@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""to_excel.py — Export CAD analysis data to professional multi-sheet Excel.
+"""to_excel.py — Export chat/tool JSON data to multi-sheet Excel.
 
-Sources (pick one):
-  1. DXF file directly  → analyze on-the-fly then export
-  2. JSON file          → pre-analyzed output from cad_analyzer
-  3. layers_agg.json    → project-wide layer stats from collect_layers
+Source:
+  1. JSON file from chat/tool extraction (cad_llm_schema-like)
 
 Sheets generated:
   📋 Summary       — key metrics (file info, entity counts, scale)
@@ -16,9 +14,8 @@ Sheets generated:
   📝 Notes         — annotation texts
 
 Usage:
-  python3 to_excel.py drawing.dxf                  # analyze + export
-  python3 to_excel.py drawing.dxf -o report.xlsx
-  python3 to_excel.py layers_agg.json --project    # project-wide stats
+  python3 to_excel.py report_payload.json
+  python3 to_excel.py report_payload.json -o report.xlsx
 """
 
 from __future__ import annotations
@@ -26,11 +23,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
-
-import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import (
     Alignment, Border, Font, GradientFill, PatternFill, Side
@@ -443,203 +437,14 @@ def export_llm_json_excel(json_path: Path, out_path: Path) -> None:
     print(f"  Saved: {out_path}  ({sz:.0f} KB)  — {len(wb.sheetnames)} sheets")
 
 
-# ── Project-wide mode (from layers_agg.json) ───────────────────────────────
-
-def export_project_excel(agg_path: Path, out_path: Path) -> None:
-    """Build project-wide Excel from layers_agg.json or symbols_agg.json."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    from cad_analyzer import classify_layer, layer_label
-
-    print(f"  Loading {agg_path.name} …", end=" ", flush=True)
-    raw = json.loads(agg_path.read_text(encoding="utf-8"))
-    print("OK")
-
-    wb = Workbook()
-    wb.remove(wb.active)   # remove default sheet
-
-    if "by_layer" in raw:
-        # layers_agg.json
-        by_layer = raw["by_layer"]
-        layers_list = []
-        for name, entry in sorted(by_layer.items(), key=lambda x: -x[1]["files"]):
-            cat = classify_layer(name)
-            layers_list.append({
-                "layer": name,
-                "category": cat,
-                "label": layer_label(cat),
-                "files": entry["files"],
-                "total": entry["total_entities"],
-                "entity_types": entry.get("entity_types", {}),
-            })
-
-        ws = wb.create_sheet("🗂 Layers")
-        _set_tab_color(ws, 1)
-        headers = ["レイヤー名", "カテゴリ", "ラベル", "ファイル数", "総エンティティ", "INSERT", "TEXT", "LINE/POLY"]
-        widths  = [42, 14, 14, 10, 14, 10, 10, 12]
-        _sheet_title(ws, "🗂 プロジェクト全体レイヤー一覧", f"{len(layers_list)} unique layers")
-        _header_row(ws, 3, headers, widths)
-        for i, row in enumerate(layers_list, 4):
-            et = row["entity_types"]
-            vals = [
-                row["layer"], row["category"], row["label"],
-                row.get("files", 0), row["total"],
-                et.get("INSERT", 0),
-                et.get("TEXT", 0) + et.get("MTEXT", 0),
-                et.get("LINE", 0) + et.get("LWPOLYLINE", 0),
-            ]
-            _data_row(ws, i, vals, alt=(i % 2 == 0))
-        _freeze_and_filter(ws, "A4")
-
-    elif "by_block" in raw:
-        # symbols_agg.json
-        by_block = raw["by_block"]
-        syms = []
-        for name, entry in sorted(by_block.items(), key=lambda x: -x[1]["total_count"]):
-            top_layer = next(iter(entry.get("layers", {})), "")
-            cat = classify_layer(top_layer) if top_layer else "other"
-            syms.append({
-                "block_name": name,
-                "category": cat,
-                "label": layer_label(cat),
-                "count": entry["total_count"],
-                "files": entry["files"],
-                "layers": entry.get("layers", {}),
-            })
-
-        ws = wb.create_sheet("🧱 Symbols")
-        build_symbols_sheet(ws, syms)
-
-    wb.save(str(out_path))
-    print(f"  Saved: {out_path}  ({out_path.stat().st_size/1024:.0f} KB)")
-
-
-# ── Single-file DXF mode ───────────────────────────────────────────────────
-
-def export_dxf_excel(dxf_path: Path, out_path: Path) -> None:
-    """Analyze a DXF file and export to Excel."""
-    sys.path.insert(0, str(Path(__file__).parent))
-    from cad_analyzer import (
-        classify_layer, layer_label, extract_texts, extract_inserts,
-        extract_closed_polylines, extract_layer_entity_stats,
-        extract_room_candidates, pair_rooms_with_areas,
-        summarize_blocks, summarize_inserts_by_category,
-        extract_notes, detect_scale, units_to_m2, extract_title_block,
-    )
-    import ezdxf
-    import time
-
-    print(f"  Reading {dxf_path.name} …", end=" ", flush=True)
-    doc = ezdxf.readfile(str(dxf_path))
-    msp = doc.modelspace()
-
-    texts    = extract_texts(msp)
-    inserts  = extract_inserts(msp)
-    bounds   = extract_closed_polylines(msp)
-    lyr_stat = extract_layer_entity_stats(msp)
-    title    = extract_title_block(doc, msp)
-    scale    = detect_scale(texts)
-
-    rooms        = pair_rooms_with_areas(extract_room_candidates(texts), texts)
-    block_summary= summarize_blocks(inserts)
-    cat_summary  = summarize_inserts_by_category(inserts)
-    notes        = extract_notes(texts)
-    print("OK")
-
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    # ── Summary ──
-    ws_sum = wb.create_sheet("📋 Summary")
-    build_summary_sheet(ws_sum, {
-        "meta": {
-            "filename": dxf_path.name,
-            "title":    title.get("工事名", title.get("図面名称", dxf_path.stem)),
-            "scale":    f"1:{scale:.0f}",
-            "date":     title.get("日付", time.strftime("%Y-%m-%d")),
-        },
-        "stats": {
-            "total_layers":      len(list(doc.layers)),
-            "classified_layers": sum(1 for l in doc.layers if classify_layer(l.dxf.name) != "other"),
-            "total_entities":    sum(sum(v.values()) for v in lyr_stat.values()),
-            "total_inserts":     len(inserts),
-            "total_texts":       len(texts),
-            "total_boundaries":  len(bounds),
-            "total_hatches":     0,
-        },
-    })
-
-    # ── Layers ──
-    layers_list = []
-    for layer in sorted(doc.layers, key=lambda l: -lyr_stat.get(l.dxf.name, {}).get("INSERT", 0)):
-        name = layer.dxf.name
-        cat  = classify_layer(name)
-        et   = lyr_stat.get(name, {})
-        layers_list.append({
-            "layer": name, "category": cat, "label": layer_label(cat),
-            "total": sum(et.values()), "entity_types": et,
-        })
-    ws_lay = wb.create_sheet("🗂 Layers")
-    build_layers_sheet(ws_lay, layers_list)
-
-    # ── Symbols ──
-    syms_list = []
-    for cat, entry in sorted(cat_summary.items(), key=lambda x: -x[1]["count"]):
-        top_block = next(iter(entry["blocks"]), "—")
-        syms_list.append({
-            "block_name": top_block + (f" +{len(entry['blocks'])-1}" if len(entry["blocks"]) > 1 else ""),
-            "category": cat, "label": entry["label"],
-            "count": entry["count"], "files": 1,
-            "layers": entry.get("layers", {}),
-        })
-    ws_sym = wb.create_sheet("🧱 Symbols")
-    build_symbols_sheet(ws_sym, syms_list)
-
-    # ── Equipment ──
-    ws_eq = wb.create_sheet("🚪 Equipment")
-    build_equipment_sheet(ws_eq, block_summary, cat_summary)
-
-    # ── Areas ──
-    areas_list = []
-    for b in bounds:
-        m2 = units_to_m2(b.area_units, scale)
-        if 1.0 <= m2 <= 5000.0:
-            areas_list.append({
-                "category": b.category, "label": layer_label(b.category),
-                "layer": b.layer, "area_m2": m2,
-                "point_count": len(b.points),
-            })
-    areas_list.sort(key=lambda x: -x["area_m2"])
-    ws_area = wb.create_sheet("📐 Areas")
-    build_areas_sheet(ws_area, areas_list)
-
-    # ── Rooms ──
-    ws_room = wb.create_sheet("🏠 Rooms")
-    build_rooms_sheet(ws_room, rooms)
-
-    # ── Notes ──
-    notes_list = [{"text": n.text, "category": n.category, "layer": n.layer, "x": n.x, "y": n.y}
-                  for n in notes]
-    ws_note = wb.create_sheet("📝 Notes")
-    build_notes_sheet(ws_note, notes_list)
-
-    wb.save(str(out_path))
-    sz = out_path.stat().st_size / 1024
-    print(f"  Saved: {out_path}  ({sz:.0f} KB)  — {len(wb.sheetnames)} sheets")
-
-
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export CAD analysis data to professional multi-sheet Excel"
+        description="Export chat/tool JSON data to multi-sheet Excel"
     )
-    parser.add_argument("input", help=".dxf file  OR  layers_agg.json / symbols_agg.json")
+    parser.add_argument("input", help="Input JSON from chat/tool extraction")
     parser.add_argument("-o", "--output", default=None, help="Output .xlsx path")
-    parser.add_argument("--project", action="store_true",
-                        help="Project-wide mode: input is layers_agg.json or symbols_agg.json")
-    parser.add_argument("--llm", action="store_true",
-                        help="LLM output mode: input is JSON from LLM (follows cad_llm_schema.json)")
     args = parser.parse_args()
 
     inp = Path(args.input)
@@ -651,19 +456,10 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"\n[to_excel] {inp.name} → {out}\n")
-
-    if args.llm:
-        export_llm_json_excel(inp, out)
-    elif args.project or (inp.suffix == ".json" and not args.llm):
-        # Auto-detect: nếu JSON có key by_layer/by_block → project mode
-        # nếu có key meta/layers/symbols → LLM mode
-        raw = json.loads(inp.read_text(encoding="utf-8"))
-        if "by_layer" in raw or "by_block" in raw:
-            export_project_excel(inp, out)
-        else:
-            export_llm_json_excel(inp, out)
-    else:
-        export_dxf_excel(inp, out)
+    if inp.suffix.lower() != ".json":
+        print("Error: input must be a JSON file generated from chat/tool data.")
+        sys.exit(1)
+    export_llm_json_excel(inp, out)
 
     print("\nDone ✅")
 
