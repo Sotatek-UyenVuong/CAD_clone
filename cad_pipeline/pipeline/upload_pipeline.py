@@ -268,7 +268,7 @@ def run_upload_pipeline(
         if layout_detection_enabled:
             try:
                 blocks = detector.predict_file(image_path)
-            except ImportError as exc:
+            except Exception as exc:
                 layout_detection_enabled = False
                 blocks = []
                 log(

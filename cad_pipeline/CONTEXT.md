@@ -60,20 +60,20 @@ Từ `config.py`:
 
 Flow:
 1. Persist original (S3 hoặc local).
-2. Nếu upload `DWG`:
-   - convert `DWG -> DXF` bằng script `tools/_archive/dwg_to_dxf_converter.py`,
-   - persist DXF vào thư mục bền vững `cad_pipeline/data/originals/<file_id>/cad/`,
-   - index thành 1 page có `dxf_path`,
-   - lưu `dxf_path` ở cả `files` và `pages` để tool đếm dùng trực tiếp.
-3. Render PDF -> page images (hoặc marker text pipeline cho office files).
-4. Tạo/ensure folder + file records trong MongoDB.
-5. Mỗi page:
+2. Rẽ nhánh theo định dạng:
+   - `DWG`: convert `DWG -> DXF` bằng script `tools/_archive/dwg_to_dxf_converter.py`, persist DXF vào `cad_pipeline/data/originals/<file_id>/cad/`, rồi index thành 1 page có `dxf_path`.
+   - `DXF`: đi thẳng CAD geometry flow, persist vào thư mục bền vững và index 1 page có `dxf_path`.
+   - `DOC/DOCX`: convert sang PDF (LibreOffice headless), sau đó đi theo flow PDF.
+   - `XLS/XLSX`: dùng marker text pipeline để tách nội dung theo sheet/page, lưu `context_md` dạng text.
+   - `PDF` hoặc ảnh (`png/jpg/jpeg/webp/gif/bmp/tif/tiff`): render thành page images để xử lý layout/page context.
+3. Tạo/ensure folder + file records trong MongoDB.
+4. Với flow page-based (PDF/ảnh):
    - tạo `image_url`,
    - layout detection (có fallback nếu unavailable),
    - page summary + block processing concurrent,
    - build `context_md`,
    - save page.
-6. Kết thúc file:
+5. Kết thúc file:
    - build `files.summary`,
    - build `files.short_summary`,
    - build `files.title_block_index`,
