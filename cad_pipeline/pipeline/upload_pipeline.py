@@ -753,9 +753,6 @@ def _run_dxf_single_page_pipeline(
     )
     context_md = (
         "# Page 1\n\n"
-        f"- Source file: {source_file.name}\n"
-        f"- DXF path: {dxf_path_abs}\n"
-        "- This file is indexed as CAD geometry for count workflows.\n\n"
         f"{catalog_md}"
     )
     log("[4/6] Creating DXF-backed page context...")
