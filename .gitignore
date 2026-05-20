@@ -65,6 +65,7 @@ pretrained/
 *.pth
 *.pkl
 *.onnx
+!layout_detect/models/checkpoints/cad_layout_v7_swapsplit/model_final.pth
 
 # Software packages
 *.deb

@@ -1,0 +1,1 @@
+layout_detect/models/checkpoints/cad_layout_v7_swapsplit/model_final.pth filter=lfs diff=lfs merge=lfs -text
